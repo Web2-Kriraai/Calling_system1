@@ -13,6 +13,15 @@ export function getRedis() {
         maxRetriesPerRequest: null, // Required by BullMQ
     });
 
-    console.log('✅ Redis Connected');
+    redis.on('connect', () => {
+        console.log('✅ Redis Connected');
+    });
+
+    redis.on('error', (err) => {
+        if (err.code !== 'ECONNREFUSED') {
+            console.error('❌ Redis Error:', err.message);
+        }
+    });
+
     return redis;
 }

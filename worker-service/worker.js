@@ -176,7 +176,7 @@ export class CallWorker {
                                 attempt: currentAttempts,
                                 timestamp: new Date(),
                                 status: 'completed',
-                                message: `Processed with unknown status: ${apiStatus}`,
+                                message: `Processed`,
                                 response: result.apiResponse
                             }
                         }
@@ -234,7 +234,7 @@ export class CallWorker {
     }
 
     async executeCall(data) {
-        const url = 'https://imelda-vindictive-semicolloquially.ngrok-free.dev/api/v1/calls/initiate-campaign-call';
+        const url = 'http://72.60.221.48:8000/api/v1/calls/initiate-campaign-call';
         const payload = {
             campaign_id: data.campaignId,
             contact_id: data.contactId
@@ -270,49 +270,158 @@ export class CallWorker {
         const { campaignId, contactId } = jobData;
         const apiResponse = result.apiResponse || {};
         const callId = apiResponse.call_id || apiResponse.id || `call_${Date.now()}`;
-        const tier = metadata.voiceTier || 'premium';
+        const duration = apiResponse.duration || 0; // ms
+        const db = await getDb();
 
-        // Determine Webhook URL
-        const webhookUrl = tier === 'basic' ? config.webhooks.basic : config.webhooks.premium;
+        console.log(`💰 [Worker] Processing credit deduction for call ${callId}...`);
 
-        if (!webhookUrl) {
-            console.warn(`⚠️ [Worker] No webhook URL configured for tier: ${tier}`);
-        } else {
-            console.log(`🔗 [Worker] Triggering ${tier} webhook for call ${callId}...`);
+        try {
+            // 1. Fetch Campaign and User
+            const campaign = await db.collection('campaigns').findOne({ _id: new ObjectId(campaignId) });
+            if (!campaign) throw new Error('Campaign not found');
 
-            const webhookPayload = {
-                call_id: callId,
-                campaign_id: campaignId,
-                contact_id: contactId,
-                status: 'completed',
-                call_data: {
-                    events: [
-                        {
-                            event_type: 'call.completed',
-                            data: {
-                                data: {
-                                    duration: apiResponse.duration || 0 // Use duration from response if available
-                                }
-                            }
-                        }
-                    ]
+            // Find user associated with the campaign
+            let user = await db.collection('users').findOne({ email: campaign.createdBy });
+            if (!user) {
+                // Secondary lookup if needed
+                user = await db.collection('users').findOne({ _id: new ObjectId(campaign.userId || campaign.createdBy?.id) });
+            }
+            if (!user) throw new Error('User not found');
+
+            // 2. Determine Plan Tier and Rate
+            let currentTier = 'A'; // Default to Plan A
+            let ratePerMinute = 0.08; // Default rate
+
+            try {
+                // Check if user has creditPlan (new system)
+                if (user.creditPlan && user.creditPlan.currentTier) {
+                    currentTier = user.creditPlan.currentTier;
+
+                    // Grace period check (simplified)
+                    if (user.creditPlan.deadline && new Date() > new Date(user.creditPlan.deadline)) {
+                        // Keep tier for now but log warning
+                        console.log(`[Worker] User ${user.email} plan deadline passed.`);
+                    }
+                } else {
+                    // Fallback to Tier A
+                    currentTier = 'A';
                 }
-            };
 
-            fetch(webhookUrl, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(webhookPayload)
-            }).catch(err => console.error(`❌ [Worker] Webhook failed:`, err.message));
+                // Fetch dynamic rate from database
+                const tierToId = { 'A': 'starter', 'B': 'professional', 'C': 'enterprise', 'D': 'premium' };
+                const targetPackageId = tierToId[currentTier] || 'starter';
+                const pkg = await db.collection('creditpackages').findOne({ packageId: targetPackageId });
+
+                if (pkg && typeof pkg.pricePerMinute === 'number') {
+                    ratePerMinute = pkg.pricePerMinute;
+                } else {
+                    const fallbackRates = { 'A': 0.08, 'B': 0.075, 'C': 0.07, 'D': 0.065 };
+                    ratePerMinute = fallbackRates[currentTier] || 0.08;
+                }
+            } catch (pricingError) {
+                console.error(`[Worker] Pricing lookup failed:`, pricingError.message);
+                ratePerMinute = 0.08;
+            }
+
+            // 3. Billing Brackets and Cost Calculation
+            const durationInSeconds = duration / 1000;
+            const fullMinutes = Math.floor(durationInSeconds / 60);
+            const remainingSeconds = durationInSeconds % 60;
+
+            const FALLBACK_BRACKETS = [
+                { fromSecond: 1, toSecond: 15, percentOfRatePerMinute: 25 },
+                { fromSecond: 16, toSecond: 30, percentOfRatePerMinute: 50 },
+                { fromSecond: 31, toSecond: 45, percentOfRatePerMinute: 75 },
+                { fromSecond: 46, toSecond: 60, percentOfRatePerMinute: 100 }
+            ];
+
+            let billingBrackets = FALLBACK_BRACKETS;
+            const bracketSetting = await db.collection('systemsettings').findOne({ key: 'callBillingBracketsV1' });
+            if (bracketSetting?.value && Array.isArray(bracketSetting.value)) {
+                billingBrackets = bracketSetting.value;
+            }
+
+            let partialMinuteFraction = 0;
+            if (remainingSeconds > 0) {
+                const matchedBracket = billingBrackets.find(b => remainingSeconds >= b.fromSecond && remainingSeconds <= b.toSecond);
+                const bracket = matchedBracket || billingBrackets[billingBrackets.length - 1];
+                partialMinuteFraction = (bracket?.percentOfRatePerMinute ?? 100) / 100;
+            }
+
+            const cost = (fullMinutes * ratePerMinute) + (partialMinuteFraction * ratePerMinute);
+
+            // 4. Atomic Credit Deduction and Transaction
+            if (user.credits < cost) {
+                console.warn(`⚠️ [Worker] Insufficient credits for ${user.email}. Cost: ${cost}, Balance: ${user.credits}`);
+                await db.collection('CallLogs').updateOne(
+                    { call_id: callId },
+                    { $set: { creditsDeducted: false, creditDeductionError: 'insufficient_credits', processedAt: new Date() } },
+                    { upsert: true }
+                );
+                return;
+            }
+
+            await db.collection('users').updateOne(
+                { _id: user._id, credits: { $gte: cost } },
+                { $inc: { credits: -cost } }
+            );
+
+            // 5. Log Transaction
+            await db.collection('credittransactions').insertOne({
+                userId: user._id,
+                userEmail: user.email,
+                type: 'call_deduction',
+                amount: -cost,
+                balanceAfter: (user.credits || 0) - cost,
+                description: `Call Usage - ${Math.round(durationInSeconds)}s`,
+                reference: {
+                    campaignId: campaign._id,
+                    campaignName: campaign.name || campaign.campaignName,
+                    callDuration: durationInSeconds,
+                    contactPhone: jobData.phone,
+                    callId: callId
+                },
+                createdAt: new Date()
+            });
+
+            // 6. Update Analytics
+            await db.collection('callstats').updateOne(
+                { userId: user._id.toString(), campaignId: campaign._id.toString() },
+                {
+                    $inc: { totalDuration: duration, callCount: 1, totalCreditsSpent: cost },
+                    $set: { lastCallAt: new Date() }
+                },
+                { upsert: true }
+            );
+
+            // 7. Success log
+            await db.collection('CallLogs').updateOne(
+                { call_id: callId },
+                {
+                    $set: {
+                        creditsDeducted: true,
+                        creditsDeductedAmount: cost,
+                        processedAt: new Date(),
+                        duration: durationInSeconds,
+                        campaign_id: campaign._id,
+                        contact_id: new ObjectId(contactId)
+                    }
+                },
+                { upsert: true }
+            );
+
+            console.log(`✅ [Worker] Credits deducted successfully: -${cost.toFixed(4)} from ${user.email}`);
+
+        } catch (error) {
+            console.error(`❌ [Worker] Post-call deduction failed:`, error.message);
         }
 
-        // Trigger Analysis API
+        // 8. Trigger Analysis API
         const analysisUrl = config.analysis.apiUrl;
         if (analysisUrl) {
             console.log(`📊 [Worker] Triggering analysis for call ${callId}...`);
-            fetch(`${analysisUrl}/${callId}`, {
-                method: 'GET' // or POST depending on your API, user said "call URL"
-            }).catch(err => console.error(`❌ [Worker] Analysis API failed:`, err.message));
+            fetch(`${analysisUrl}/${callId}`, { method: 'GET' })
+                .catch(err => console.error(`❌ [Worker] Analysis API failed:`, err.message));
         }
     }
 }
