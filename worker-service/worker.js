@@ -13,8 +13,8 @@ export class CallWorker {
     constructor() {
         this.worker = new Worker(queueName, this.processJob.bind(this), {
             connection: getRedis(),
-            concurrency: 100,
-            lockDuration: 60000, // 60 seconds
+            concurrency: 20,
+            lockDuration: 300000, // 5 minutes to prevent "Missing Lock" during long API calls
             limiter: {
                 max: 5000,
                 duration: 1000,
@@ -41,17 +41,22 @@ export class CallWorker {
         const campaign = await db.collection('campaigns').findOne({ _id: new ObjectId(campaignId) });
         if (!campaign || campaign.status !== 'active') {
             const reason = !campaign ? 'Campaign not found' : `Campaign status is ${campaign.status}`;
-            console.log(`⏸️ [Worker] Job ${job.id} for campaign ${campaignId} ignored: ${reason}`);
-
-            if (campaign?.status === 'paused') {
-                // If paused, move back to delayed to wait for resumption
-                await job.moveToDelayed(Date.now() + 60000, job.token);
-            }
+            console.log(`⏸️ [Worker] Job ${job.id} for campaign ${campaignId} ignored: ${reason}.`);
+            // Just return. The job is marked as "completed" in BullMQ, but since we didn't update MongoDB status, 
+            // the Scheduler will pick up this contact again in the next loop when the campaign becomes active.
             return;
         }
 
-        // 0.1 Fetch latest contact data to ensure it's not already handled
+        // 0.1 Fetch latest contact data and sync with BullMQ job data
         const contact = await db.collection('contactprocessings').findOne({ _id: contactObjId });
+
+        // Ensure BullMQ job data stays in sync with real-time DB state
+        await job.updateData({
+            ...job.data,
+            callReceiveStatus: contact?.callReceiveStatus,
+            dbStatus: contact?.status
+        });
+
         if (!contact || ['completed', 'failed'].includes(contact.status)) {
             console.log(`⏩ [Worker] Skipping contact ${contactId}: Status is already ${contact?.status || 'unknown'}`);
             return;
@@ -68,10 +73,13 @@ export class CallWorker {
         );
 
         if (!hasSlot) {
-            console.log(`🚦 [Worker] Concurrency limit reached for ${campaignId} or ${userId}. Re-queuing.`);
-            await job.moveToDelayed(Date.now() + 30000, job.token);
-            return; // Return instead of throw to avoid lock conflict
+            console.log(`🚦 [Worker] Limit reached for ${campaignId}. Re-queuing naturally.`);
+            // Throwing an error forces BullMQ to retry the job according to its own backoff settings, 
+            // without needing manual state (moveToDelayed) which causes "Missing Lock" errors.
+            throw new Error('CONCURRENCY_LIMIT_REACHED');
         }
+
+        let shouldReleaseSlot = true; // Declare here so it is accessible in finally{}
 
         try {
             // 3. Update Status to 'processing'
@@ -92,25 +100,64 @@ export class CallWorker {
             // 5. Execute API Call
             const result = await this.executeCall(job.data);
 
-            // PRODUCTION FIX: Correctly map both your API's 'success' status and the legacy status codes
-            const apiResponse = result.apiResponse || {};
-            const isApiSuccess = apiResponse.status === 'success' || apiResponse.callreceivestatus === 3;
-            const isApiNotReceived = apiResponse.callreceivestatus === 1 || apiResponse.status === 'not_received';
+            // Re-fetch contact to get the latest callReceiveStatus from MongoDB
+            const updatedContact = await db.collection('contactprocessings').findOne({ _id: contactObjId });
+
+            // Sync BullMQ job data again after API call to reflect latest status
+            await job.updateData({
+                ...job.data,
+                callReceiveStatus: updatedContact?.callReceiveStatus,
+                dbStatus: updatedContact?.status
+            });
+
+            const apiResponse = result?.apiResponse || {};
+
+            // Check status from both DB and API Response (API is more real-time immediately after execution)
+            const dbStatus = parseInt(updatedContact?.callReceiveStatus) || 0;
+            const apiStatus = parseInt(apiResponse.callreceivestatus || apiResponse.call?.status) || 0;
+
+            // Use the "most advanced" status (3 > 2 > 1 > 0)
+            const callStatus = Math.max(dbStatus, apiStatus);
+
+            console.log(`🔍 [Worker] Status Check for ${contactId}: DB=${dbStatus}, API=${apiStatus} -> Final=${callStatus}`);
 
             const maxRetries = metadata.maxRetryAttempts || 3;
             const retryDelayMinutes = metadata.retryDelayMinutes || 30;
             const currentRetryCount = currentContact.retryCount || 0;
             const currentAttempts = (currentContact.callAttempts?.length || 0) + 1;
 
-            // 6. Update Database based on API response
-            if (isApiSuccess) {
-                // Success
+            shouldReleaseSlot = true;
+
+            if (callStatus === 2) {
+                // RUNNING: Do NOT release slot yet. Wait for webhook.
+                shouldReleaseSlot = false;
+                await db.collection('contactprocessings').updateOne(
+                    { _id: contactObjId },
+                    {
+                        $set: {
+                            status: 'running',
+                            callReceiveStatus: 2,
+                            updatedAt: new Date()
+                        },
+                        $push: {
+                            callAttempts: {
+                                attempt: currentAttempts,
+                                timestamp: new Date(),
+                                status: 'running',
+                                message: 'Call is currently active'
+                            }
+                        }
+                    }
+                );
+                console.log(`📡 [Worker] Call ${contactId} is RUNNING. Holding slot.`);
+            } else if (callStatus === 3) {
+                // COMPLETED: Success, release slot.
                 await db.collection('contactprocessings').updateOne(
                     { _id: contactObjId },
                     {
                         $set: {
                             status: 'completed',
-                            result,
+                            callReceiveStatus: 3,
                             completedAt: new Date(),
                             updatedAt: new Date()
                         },
@@ -118,23 +165,22 @@ export class CallWorker {
                             callAttempts: {
                                 attempt: currentAttempts,
                                 timestamp: new Date(),
-                                status: 'success',
-                                message: 'call completed successfully',
-                                response: result.apiResponse
+                                status: 'completed',
+                                message: 'Processed'
                             }
                         }
                     }
                 );
-                console.log(`✅ [Worker] Successfully completed job ${job.id}`);
+                console.log(`✅ [Worker] Call ${contactId} COMPLETED. Releasing slot.`);
 
-                // 7. Trigger Webhooks and Analysis
+                // Trigger post-call actions (billing/analysis)
                 try {
-                    await this.triggerPostCallActions(job.data, result, metadata);
+                    await this.triggerPostCallActions(job.data, result, metadata, currentContact);
                 } catch (triggerError) {
-                    console.error(`⚠️ [Worker] Post-call actions failed for ${job.id}:`, triggerError.message);
+                    console.error(`⚠️ [Worker] Post-call actions failed:`, triggerError.message);
                 }
-            } else if (isApiNotReceived) {
-                // Handle business-level retry logic
+            } else {
+                // FAILED (0) or NOT RECEIVED (1): Retry if possible, release slot.
                 const isRetryable = currentRetryCount + 1 < maxRetries;
                 const nextStatus = isRetryable ? 'retry' : 'failed';
                 const nextRetryAt = isRetryable ? new Date(Date.now() + retryDelayMinutes * 60000) : null;
@@ -144,7 +190,7 @@ export class CallWorker {
                     {
                         $set: {
                             status: nextStatus,
-                            lastError: 'call not received',
+                            callReceiveStatus: callStatus,
                             nextRetryAt,
                             updatedAt: new Date()
                         },
@@ -154,34 +200,12 @@ export class CallWorker {
                                 attempt: currentAttempts,
                                 timestamp: new Date(),
                                 status: nextStatus,
-                                message: 'call not received',
-                                response: result.apiResponse
+                                message: callStatus === 1 ? 'Not Received' : 'API Attempt Failed'
                             }
                         }
                     }
                 );
-                console.log(`⚠️  [Worker] Retry required for job ${job.id}. Next status: ${nextStatus}. Delay: ${retryDelayMinutes}m`);
-
-                // Return normally to remove from current queue. The scheduler will pick it up after the delay.
-                return result;
-            } else {
-                // Unexpected status code handling
-                console.warn(`❓ [Worker] Unexpected API response for job ${job.id}:`, apiResponse);
-                await db.collection('contactprocessings').updateOne(
-                    { _id: contactObjId },
-                    {
-                        $set: { status: 'completed', result, updatedAt: new Date() },
-                        $push: {
-                            callAttempts: {
-                                attempt: currentAttempts,
-                                timestamp: new Date(),
-                                status: 'completed',
-                                message: `Processed`,
-                                response: result.apiResponse
-                            }
-                        }
-                    }
-                );
+                console.log(`🔁 [Worker] Call ${contactId} FAILED/RETRY (Status: ${callStatus}). Releasing slot.`);
             }
 
             return result;
@@ -215,21 +239,19 @@ export class CallWorker {
                             attempt: currentAttempts,
                             timestamp: new Date(),
                             status,
-                            message: `System Error: ${error.message}`,
-                            response: null
+                            message: `System Error: ${error.message}`
                         }
                     }
                 }
             );
 
-            // PRODUCTION FIX: We NEVER throw here for business-handled failures.
-            // Throwing makes BullMQ retry immediately (ignoring retryDelayMinutes).
-            // We've already updated MongoDB with the correct status (retry or failed).
             console.log(`✅ [Worker] Error handled for contact ${contactId}. Next status: ${status}.`);
             return { success: false, error: error.message };
         } finally {
-            // 6. Release Concurrency Slot
-            await concurrencyGuard.releaseSlot(campaignId, userId);
+            // 6. Release Concurrency Slot (Conditional)
+            if (typeof shouldReleaseSlot === 'undefined' || shouldReleaseSlot === true) {
+                await concurrencyGuard.releaseSlot(campaignId, userId);
+            }
         }
     }
 
@@ -266,52 +288,46 @@ export class CallWorker {
         };
     }
 
-    async triggerPostCallActions(jobData, result, metadata) {
+    async triggerPostCallActions(jobData, result, metadata, contact) {
         const { campaignId, contactId } = jobData;
         const apiResponse = result.apiResponse || {};
-        const callId = apiResponse.call_id || apiResponse.id || `call_${Date.now()}`;
-        const duration = apiResponse.duration || 0; // ms
+
+        // Robust ID extraction
+        const callId = apiResponse.call?.id || apiResponse.call_id || apiResponse.id || apiResponse.callId || `call_${Date.now()}`;
+
+        // Robust duration extraction (ms)
+        const duration = apiResponse.call?.duration || apiResponse.duration || 0;
+
         const db = await getDb();
 
-        console.log(`💰 [Worker] Processing credit deduction for call ${callId}...`);
+        console.log(`💰 [Worker] Processing credit deduction for Call ID: ${callId} (Duration: ${duration}ms)...`);
 
         try {
             // 1. Fetch Campaign and User
             const campaign = await db.collection('campaigns').findOne({ _id: new ObjectId(campaignId) });
-            if (!campaign) throw new Error('Campaign not found');
+            if (!campaign) throw new Error(`Campaign ${campaignId} not found`);
 
             // Find user associated with the campaign
             let user = await db.collection('users').findOne({ email: campaign.createdBy });
             if (!user) {
-                // Secondary lookup if needed
                 user = await db.collection('users').findOne({ _id: new ObjectId(campaign.userId || campaign.createdBy?.id) });
             }
-            if (!user) throw new Error('User not found');
+            if (!user) throw new Error(`User for campaign ${campaignId} not found`);
 
             // 2. Determine Plan Tier and Rate
-            let currentTier = 'A'; // Default to Plan A
-            let ratePerMinute = 0.08; // Default rate
+            let currentTier = 'A';
+            let ratePerMinute = 0.08;
 
             try {
-                // Check if user has creditPlan (new system)
                 if (user.creditPlan && user.creditPlan.currentTier) {
                     currentTier = user.creditPlan.currentTier;
-
-                    // Grace period check (simplified)
-                    if (user.creditPlan.deadline && new Date() > new Date(user.creditPlan.deadline)) {
-                        // Keep tier for now but log warning
-                        console.log(`[Worker] User ${user.email} plan deadline passed.`);
-                    }
-                } else {
-                    // Fallback to Tier A
-                    currentTier = 'A';
                 }
 
-                // Fetch dynamic rate from database
+                // Map UI tier codes to package identifiers
                 const tierToId = { 'A': 'starter', 'B': 'professional', 'C': 'enterprise', 'D': 'premium' };
                 const targetPackageId = tierToId[currentTier] || 'starter';
-                const pkg = await db.collection('creditpackages').findOne({ packageId: targetPackageId });
 
+                const pkg = await db.collection('creditpackages').findOne({ packageId: targetPackageId });
                 if (pkg && typeof pkg.pricePerMinute === 'number') {
                     ratePerMinute = pkg.pricePerMinute;
                 } else {
@@ -319,7 +335,7 @@ export class CallWorker {
                     ratePerMinute = fallbackRates[currentTier] || 0.08;
                 }
             } catch (pricingError) {
-                console.error(`[Worker] Pricing lookup failed:`, pricingError.message);
+                console.warn(`[Worker] Pricing lookup error, using fallback 0.08:`, pricingError.message);
                 ratePerMinute = 0.08;
             }
 
@@ -348,23 +364,37 @@ export class CallWorker {
                 partialMinuteFraction = (bracket?.percentOfRatePerMinute ?? 100) / 100;
             }
 
-            const cost = (fullMinutes * ratePerMinute) + (partialMinuteFraction * ratePerMinute);
+            const cost = parseFloat(((fullMinutes * ratePerMinute) + (partialMinuteFraction * ratePerMinute)).toFixed(6));
 
-            // 4. Atomic Credit Deduction and Transaction
+            // 4. Atomic Credit Deduction
             if (user.credits < cost) {
                 console.warn(`⚠️ [Worker] Insufficient credits for ${user.email}. Cost: ${cost}, Balance: ${user.credits}`);
                 await db.collection('CallLogs').updateOne(
                     { call_id: callId },
-                    { $set: { creditsDeducted: false, creditDeductionError: 'insufficient_credits', processedAt: new Date() } },
+                    {
+                        $set: {
+                            creditsDeducted: false,
+                            creditDeductionError: 'insufficient_credits',
+                            processedAt: new Date(),
+                            updatedAt: new Date()
+                        }
+                    },
                     { upsert: true }
                 );
                 return;
             }
 
-            await db.collection('users').updateOne(
+            const deductionResult = await db.collection('users').updateOne(
                 { _id: user._id, credits: { $gte: cost } },
-                { $inc: { credits: -cost } }
+                {
+                    $inc: { credits: -cost },
+                    $set: { updatedAt: new Date() }
+                }
             );
+
+            if (deductionResult.modifiedCount === 0 && cost > 0) {
+                throw new Error('Credit deduction failed (likely race condition or insufficient funds)');
+            }
 
             // 5. Log Transaction
             await db.collection('credittransactions').insertOne({
@@ -372,56 +402,68 @@ export class CallWorker {
                 userEmail: user.email,
                 type: 'call_deduction',
                 amount: -cost,
-                balanceAfter: (user.credits || 0) - cost,
-                description: `Call Usage - ${Math.round(durationInSeconds)}s`,
+                balanceAfter: parseFloat(((user.credits || 0) - cost).toFixed(6)),
+                description: `Call Usage - ${Math.round(durationInSeconds)}s (${(durationInSeconds / 60).toFixed(2)}m)`,
                 reference: {
                     campaignId: campaign._id,
                     campaignName: campaign.name || campaign.campaignName,
                     callDuration: durationInSeconds,
-                    contactPhone: jobData.phone,
+                    contactPhone: contact?.mobileNumber || contact?.phone || jobData.phone,
+                    contactName: contact?.contactData?.Name || contact?.name,
                     callId: callId
                 },
-                createdAt: new Date()
+                createdAt: new Date(),
+                updatedAt: new Date()
             });
 
-            // 6. Update Analytics
-            await db.collection('callstats').updateOne(
-                { userId: user._id.toString(), campaignId: campaign._id.toString() },
+            // 6. Update Analytics (Using 'analytics' collection based on DB check)
+            const today = new Date().toISOString().split('T')[0];
+            await db.collection('analytics').updateOne(
                 {
-                    $inc: { totalDuration: duration, callCount: 1, totalCreditsSpent: cost },
-                    $set: { lastCallAt: new Date() }
+                    userId: user.email, // Analytics uses email or ID? DB check showed 'niya@gmail.com'
+                    campaignId: campaign._id.toString(),
+                    date: today
+                },
+                {
+                    $inc: {
+                        totalMinutes: parseFloat((durationInSeconds / 60).toFixed(4)),
+                        totalCalls: 1,
+                        connectedCalls: duration > 0 ? 1 : 0
+                    },
+                    $set: { updatedAt: new Date() }
                 },
                 { upsert: true }
             );
 
-            // 7. Success log
+            // 7. Update Call Log
             await db.collection('CallLogs').updateOne(
                 { call_id: callId },
                 {
                     $set: {
                         creditsDeducted: true,
                         creditsDeductedAmount: cost,
-                        processedAt: new Date(),
                         duration: durationInSeconds,
                         campaign_id: campaign._id,
-                        contact_id: new ObjectId(contactId)
+                        contact_id: new ObjectId(contactId),
+                        processedAt: new Date(),
+                        updatedAt: new Date()
                     }
                 },
                 { upsert: true }
             );
 
-            console.log(`✅ [Worker] Credits deducted successfully: -${cost.toFixed(4)} from ${user.email}`);
+            console.log(`✅ [Worker] Post-call actions completed for ${callId}. Cost: ${cost}`);
 
         } catch (error) {
-            console.error(`❌ [Worker] Post-call deduction failed:`, error.message);
+            console.error(`❌ [Worker] triggerPostCallActions CRITICAL ERROR:`, error.message);
         }
 
-        // 8. Trigger Analysis API
-        const analysisUrl = config.analysis.apiUrl;
-        if (analysisUrl) {
-            console.log(`📊 [Worker] Triggering analysis for call ${callId}...`);
+        // 8. Trigger Analysis API (Async)
+        const analysisUrl = config.analysis?.apiUrl;
+        if (analysisUrl && callId && !callId.startsWith('call_')) {
+            console.log(`📊 [Worker] Dispatching analysis for ${callId}...`);
             fetch(`${analysisUrl}/${callId}`, { method: 'GET' })
-                .catch(err => console.error(`❌ [Worker] Analysis API failed:`, err.message));
+                .catch(err => console.error(`❌ [Worker] Analysis API error:`, err.message));
         }
     }
 }

@@ -36,10 +36,6 @@ export const config = {
     concurrency: {
         globalMax: 5000,
     },
-    webhooks: {
-        basic: process.env.WEBHOOK_BASIC_URL,
-        premium: process.env.WEBHOOK_PREMIUM_URL,
-    },
     analysis: {
         apiUrl: process.env.ANALYSIS_API_URL,
     }
