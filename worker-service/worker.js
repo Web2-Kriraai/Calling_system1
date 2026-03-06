@@ -13,8 +13,8 @@ export class CallWorker {
     constructor() {
         this.worker = new Worker(queueName, this.processJob.bind(this), {
             connection: getRedis(),
-            concurrency: 20,
-            lockDuration: 300000, // 5 minutes to prevent "Missing Lock" during long API calls
+            concurrency: 2000, // Increased to allow more jobs to "wait" for campaign slots
+            lockDuration: 600000, // 10 minutes to match max call duration + polling
             limiter: {
                 max: 5000,
                 duration: 1000,
@@ -39,11 +39,15 @@ export class CallWorker {
 
         // 0. Fetch latest campaign data to check status (Ensures we respect Paused/Stopped campaigns immediately)
         const campaign = await db.collection('campaigns').findOne({ _id: new ObjectId(campaignId) });
-        if (!campaign || campaign.status !== 'active') {
-            const reason = !campaign ? 'Campaign not found' : `Campaign status is ${campaign.status}`;
+
+        if (!campaign || campaign.status !== 'active' || campaign.archive === true) {
+            const reason = !campaign ? 'Campaign not found' :
+                campaign.archive === true ? 'Campaign is archived' :
+                    `Campaign status is ${campaign.status}`;
+
             console.log(`⏸️ [Worker] Job ${job.id} for campaign ${campaignId} ignored: ${reason}.`);
             // Just return. The job is marked as "completed" in BullMQ, but since we didn't update MongoDB status, 
-            // the Scheduler will pick up this contact again in the next loop when the campaign becomes active.
+            // the Scheduler will pick up this contact again in the next loop when the campaign becomes active and not archived.
             return;
         }
 
@@ -57,29 +61,50 @@ export class CallWorker {
             dbStatus: contact?.status
         });
 
-        if (!contact || ['completed', 'failed'].includes(contact.status)) {
-            console.log(`⏩ [Worker] Skipping contact ${contactId}: Status is already ${contact?.status || 'unknown'}`);
-            return;
+        // 1. Validate Calling Hours
+        if (!isWithinBusinessHours(campaign)) {
+            console.log(`🕒 [Worker] Job ${job.id} for campaign ${campaignId} ignored: Outside calling hours.`);
+            // Throwing an error forces BullMQ to retry the job according to its own backoff settings,
+            // without needing manual state (moveToDelayed) which causes "Missing Lock" errors.
+            throw new Error('OUTSIDE_BUSINESS_HOURS');
         }
 
-        // 1. Validate Business Hours
+        // 1.1 Validate Business Hours (Legacy - shared-lib might be using businessHours as fallback)
+        // Note: The isWithinBusinessHours check above handles both callingHours and businessHours.
 
-        // 2. Acquire Distributed Concurrency Slot
-        const hasSlot = await concurrencyGuard.acquireSlot(
-            campaignId,
-            userId,
-            campaignLimit || 500,
-            userLimit || 100
-        );
+        // 2. Acquire Distributed Concurrency Slot (Wait for availability)
+        let hasSlot = false;
+        const checkInterval = 500; // Reduced to 500ms for faster acquisition
+        const startTime = Date.now();
+        const maxWaitTime = 3600000; // 1 hour safety timeout
 
-        if (!hasSlot) {
-            console.log(`🚦 [Worker] Limit reached for ${campaignId}. Re-queuing naturally.`);
-            // Throwing an error forces BullMQ to retry the job according to its own backoff settings, 
-            // without needing manual state (moveToDelayed) which causes "Missing Lock" errors.
-            throw new Error('CONCURRENCY_LIMIT_REACHED');
+        while (!hasSlot) {
+            hasSlot = await concurrencyGuard.acquireSlot(
+                campaignId,
+                userId,
+                campaignLimit || 500,
+                userLimit || 100
+            );
+
+            if (!hasSlot) {
+                if (Date.now() - startTime > maxWaitTime) {
+                    throw new Error('CONCURRENCY_WAIT_TIMEOUT');
+                }
+
+                // Check if campaign is still active while waiting
+                const currentCampaign = await db.collection('campaigns').findOne({ _id: new ObjectId(campaignId) });
+                if (!currentCampaign || currentCampaign.status !== 'active' || currentCampaign.archive === true) {
+                    console.log(`📡 [Worker] Job ${job.id} stopped waiting: Campaign no longer active.`);
+                    return;
+                }
+
+                // Wait before next check
+                await new Promise(resolve => setTimeout(resolve, checkInterval));
+            }
         }
 
         let shouldReleaseSlot = true; // Declare here so it is accessible in finally{}
+        let currentlyHoldingSlot = false;
 
         try {
             // 3. Update Status to 'processing'
@@ -87,7 +112,6 @@ export class CallWorker {
                 { _id: contactObjId },
                 { $set: { status: 'processing', lastAttemptAt: new Date() } }
             );
-
 
             // 4. Fetch latest contact data again to ensure consistent retry logic after slot acquisition
             const currentContact = await db.collection('contactprocessings').findOne({ _id: contactObjId });
@@ -99,66 +123,85 @@ export class CallWorker {
 
             // 5. Execute API Call
             const result = await this.executeCall(job.data);
+            currentlyHoldingSlot = true; // Still holding the slot from the initiation acquisition
 
-            // Re-fetch contact to get the latest callReceiveStatus from MongoDB
-            const updatedContact = await db.collection('contactprocessings').findOne({ _id: contactObjId });
+            // 6. Polling Logic: Wait for the API to register the call (Status 1, 2, or 3)
+            console.log(`⏳ [Worker] Waiting for call registration for ${contactId}...`);
+            let updatedContact = await this.pollStatus(contactId, [1, 2, 3], 30000, 1000); // 30s timeout
+            let callStatus = parseInt(updatedContact?.callReceiveStatus) || 0;
 
-            // Sync BullMQ job data again after API call to reflect latest status
+            // 7. State-Based Slot Management
+            if (callStatus === 1) {
+                // INITIATED: User wants the slot FREE while waiting for conversation to start
+                console.log(`📡 [Worker] Call ${contactId} is INITIATED. Releasing slot and waiting for transition to Running (2)...`);
+                await concurrencyGuard.releaseSlot(campaignId, userId);
+                currentlyHoldingSlot = false;
+                shouldReleaseSlot = false;
+
+                // Wait for status to become 2 (Running) or 3 (Completed)
+                updatedContact = await this.pollStatus(contactId, [2, 3], 60000, 2000);
+                callStatus = parseInt(updatedContact?.callReceiveStatus) || 0;
+
+                if (callStatus === 2) {
+                    console.log(`📡 [Worker] Call ${contactId} started RUNNING. Re-acquiring slot...`);
+                    // Re-acquire slot for the duration of the conversation
+                    let reAcquired = false;
+                    while (!reAcquired) {
+                        reAcquired = await concurrencyGuard.acquireSlot(
+                            campaignId, userId, campaignLimit || 500, userLimit || 100
+                        );
+                        if (!reAcquired) {
+                            const currentCampaign = await db.collection('campaigns').findOne({ _id: new ObjectId(campaignId) });
+                            if (!currentCampaign || currentCampaign.status !== 'active' || currentCampaign.archive === true) {
+                                console.log(`📡 [Worker] Campaign stopped. Dropping contact ${contactId}.`);
+                                return;
+                            }
+                            await new Promise(resolve => setTimeout(resolve, 2000));
+                        }
+                    }
+                    currentlyHoldingSlot = true;
+                    shouldReleaseSlot = true;
+
+                    // Now wait for completion
+                    console.log(`📡 [Worker] Slot held for ${contactId}. Waiting for completion...`);
+                    updatedContact = await this.pollStatus(contactId, [3], 600000, 2000);
+                    callStatus = parseInt(updatedContact?.callReceiveStatus) || 0;
+                }
+            } else if (callStatus === 2) {
+                // RUNNING immediately: Keep the slot and wait for completion
+                console.log(`📡 [Worker] Call ${contactId} is already RUNNING. Keeping slot and waiting for completion...`);
+                updatedContact = await this.pollStatus(contactId, [3], 600000, 2000);
+                callStatus = parseInt(updatedContact?.callReceiveStatus) || 0;
+            } else if (callStatus === 3) {
+                // COMPLETED immediately: Release slot in the next step
+                console.log(`📡 [Worker] Call ${contactId} COMPLETED immediately.`);
+            }
+
+            // Sync BullMQ job data with final status
             await job.updateData({
                 ...job.data,
-                callReceiveStatus: updatedContact?.callReceiveStatus,
+                callReceiveStatus: callStatus,
                 dbStatus: updatedContact?.status
             });
 
-            const apiResponse = result?.apiResponse || {};
-
-            // Check status from both DB and API Response (API is more real-time immediately after execution)
-            const dbStatus = parseInt(updatedContact?.callReceiveStatus) || 0;
-            const apiStatus = parseInt(apiResponse.callreceivestatus || apiResponse.call?.status) || 0;
-
-            // Use the "most advanced" status (3 > 2 > 1 > 0)
-            const callStatus = Math.max(dbStatus, apiStatus);
-
-            console.log(`🔍 [Worker] Status Check for ${contactId}: DB=${dbStatus}, API=${apiStatus} -> Final=${callStatus}`);
+            console.log(`🔍 [Worker] Final Status for ${contactId}: DB=${callStatus}`);
 
             const maxRetries = metadata.maxRetryAttempts || 3;
             const retryDelayMinutes = metadata.retryDelayMinutes || 30;
             const currentRetryCount = currentContact.retryCount || 0;
             const currentAttempts = (currentContact.callAttempts?.length || 0) + 1;
 
-            shouldReleaseSlot = true;
-
-            if (callStatus === 2) {
-                // RUNNING: Do NOT release slot yet. Wait for webhook.
-                shouldReleaseSlot = false;
-                await db.collection('contactprocessings').updateOne(
-                    { _id: contactObjId },
-                    {
-                        $set: {
-                            status: 'running',
-                            callReceiveStatus: 2,
-                            updatedAt: new Date()
-                        },
-                        $push: {
-                            callAttempts: {
-                                attempt: currentAttempts,
-                                timestamp: new Date(),
-                                status: 'running',
-                                message: 'Call is currently active'
-                            }
-                        }
-                    }
-                );
-                console.log(`📡 [Worker] Call ${contactId} is RUNNING. Holding slot.`);
-            } else if (callStatus === 3) {
+            if (callStatus === 3) {
                 // COMPLETED: Success, release slot.
+                console.log(`✅ [Worker] Call ${contactId} COMPLETED (confirmed by DB). Releasing slot.`);
+
+                // Update contact status to completed and log successful attempt
                 await db.collection('contactprocessings').updateOne(
                     { _id: contactObjId },
                     {
                         $set: {
                             status: 'completed',
-                            callReceiveStatus: 3,
-                            completedAt: new Date(),
+                            callReceiveStatus: callStatus,
                             updatedAt: new Date()
                         },
                         $push: {
@@ -166,16 +209,22 @@ export class CallWorker {
                                 attempt: currentAttempts,
                                 timestamp: new Date(),
                                 status: 'completed',
-                                message: 'Processed'
+                                message: 'Success'
                             }
                         }
                     }
                 );
-                console.log(`✅ [Worker] Call ${contactId} COMPLETED. Releasing slot.`);
+
+                // RELEASE SLOT if holding
+                if (currentlyHoldingSlot) {
+                    await concurrencyGuard.releaseSlot(campaignId, userId);
+                    currentlyHoldingSlot = false;
+                }
+                shouldReleaseSlot = false;
 
                 // Trigger post-call actions (billing/analysis)
                 try {
-                    await this.triggerPostCallActions(job.data, result, metadata, currentContact);
+                    await this.triggerPostCallActions(job.data, result, metadata, updatedContact || currentContact);
                 } catch (triggerError) {
                     console.error(`⚠️ [Worker] Post-call actions failed:`, triggerError.message);
                 }
@@ -205,6 +254,14 @@ export class CallWorker {
                         }
                     }
                 );
+
+                // RELEASE SLOT if holding
+                if (currentlyHoldingSlot) {
+                    await concurrencyGuard.releaseSlot(campaignId, userId);
+                    currentlyHoldingSlot = false;
+                }
+                shouldReleaseSlot = false;
+
                 console.log(`🔁 [Worker] Call ${contactId} FAILED/RETRY (Status: ${callStatus}). Releasing slot.`);
             }
 
@@ -248,8 +305,9 @@ export class CallWorker {
             console.log(`✅ [Worker] Error handled for contact ${contactId}. Next status: ${status}.`);
             return { success: false, error: error.message };
         } finally {
-            // 6. Release Concurrency Slot (Conditional)
+            // 6. Release Concurrency Slot (Conditional - only if we had failed unexpectedly before status loop)
             if (typeof shouldReleaseSlot === 'undefined' || shouldReleaseSlot === true) {
+                // If we get here, it means we didn't release the initial slot or re-acquired one and crashed
                 await concurrencyGuard.releaseSlot(campaignId, userId);
             }
         }
@@ -288,17 +346,84 @@ export class CallWorker {
         };
     }
 
+    /**
+     * Polls the database for a specific status update.
+     * @param {string} contactId 
+     * @param {Array} targetStatuses 
+     * @param {number} timeoutMs 
+     * @returns {Object|null} The updated contact document or last fetched version on timeout
+     */
+    async pollStatus(contactId, targetStatuses, timeoutMs = 60000, intervalMs = 2000) {
+        const db = await getDb();
+        const contactObjId = new ObjectId(contactId);
+        const startTime = Date.now();
+
+        while (Date.now() - startTime < timeoutMs) {
+            const contact = await db.collection('contactprocessings').findOne({ _id: contactObjId });
+            const status = parseInt(contact?.callReceiveStatus) || 0;
+
+            if (targetStatuses.includes(status)) {
+                return contact;
+            }
+
+            // Wait before next poll
+            await new Promise(resolve => setTimeout(resolve, intervalMs));
+        }
+
+        console.warn(`🕒 [Worker] Polling timeout for ${contactId} waiting for statuses: [${targetStatuses}]`);
+        return await db.collection('contactprocessings').findOne({ _id: contactObjId });
+    }
+
     async triggerPostCallActions(jobData, result, metadata, contact) {
         const { campaignId, contactId } = jobData;
         const apiResponse = result.apiResponse || {};
-
-        // Robust ID extraction
-        const callId = apiResponse.call?.id || apiResponse.call_id || apiResponse.id || apiResponse.callId || `call_${Date.now()}`;
-
-        // Robust duration extraction (ms)
-        const duration = apiResponse.call?.duration || apiResponse.duration || 0;
-
         const db = await getDb();
+
+        // 1. Fetch Verified Duration from CallLogs
+        let duration = 0;
+        let callId = apiResponse.call?.id || apiResponse.call_id || apiResponse.id || apiResponse.callId;
+
+        console.log("Call Id ::::::::::", callId);
+
+        try {
+            // 1.1 Use a short polling loop to wait for the webhook to create the CallLog
+            // This fixes the race condition where triggerPostCallActions starts before the webhook finishes.
+            let callLog = null;
+            const maxPollTime = 5000; // Wait up to 5 seconds
+            const pollInterval = 1000; // Check every 1 second
+            const pollStart = Date.now();
+
+            while (Date.now() - pollStart < maxPollTime) {
+                callLog = await db.collection("CallLogs").findOne({
+                    $or: [
+                        { call_id: callId },
+                        { contact_id: contactId },
+                        { contact_id: new ObjectId(contactId) }
+                    ]
+                });
+
+                if (callLog) break;
+                await new Promise(resolve => setTimeout(resolve, pollInterval));
+            }
+
+            console.log("CallLog ::::::", callLog);
+
+            if (callLog) {
+                callId = callLog.call_id || callId;
+                const completedEvent = callLog.call_data?.events?.find(e => e.event_type === 'call.completed');
+                duration = completedEvent?.data?.data?.duration || 0;
+                console.log(`📄 [Worker] Found CallLog for ${contactId}. Verified Duration: ${duration}ms`);
+            } else {
+                console.warn(`⚠️ [Worker] No CallLog found for ${contactId} after 5s wait. Falling back to API response duration.`);
+                duration = apiResponse.call?.duration || apiResponse.duration || 0;
+            }
+        } catch (logError) {
+            console.error(`❌ [Worker] Error fetching CallLog:`, logError.message);
+            duration = apiResponse.call?.duration || apiResponse.duration || 0;
+        }
+
+        // Fallback Call ID if still missing
+        callId = callId || `call_${Date.now()}`;
 
         console.log(`💰 [Worker] Processing credit deduction for Call ID: ${callId} (Duration: ${duration}ms)...`);
 
@@ -341,6 +466,8 @@ export class CallWorker {
 
             // 3. Billing Brackets and Cost Calculation
             const durationInSeconds = duration / 1000;
+
+            console.log("duratiion seconds :::::::", durationInSeconds)
             const fullMinutes = Math.floor(durationInSeconds / 60);
             const remainingSeconds = durationInSeconds % 60;
 
@@ -370,7 +497,9 @@ export class CallWorker {
             if (user.credits < cost) {
                 console.warn(`⚠️ [Worker] Insufficient credits for ${user.email}. Cost: ${cost}, Balance: ${user.credits}`);
                 await db.collection('CallLogs').updateOne(
-                    { call_id: callId },
+                    {
+                        $or: [{ contact_id: contactId }, { contact_id: new ObjectId(contactId) }]
+                    },
                     {
                         $set: {
                             creditsDeducted: false,
@@ -408,8 +537,6 @@ export class CallWorker {
                     campaignId: campaign._id,
                     campaignName: campaign.name || campaign.campaignName,
                     callDuration: durationInSeconds,
-                    contactPhone: contact?.mobileNumber || contact?.phone || jobData.phone,
-                    contactName: contact?.contactData?.Name || contact?.name,
                     callId: callId
                 },
                 createdAt: new Date(),
@@ -437,14 +564,15 @@ export class CallWorker {
 
             // 7. Update Call Log
             await db.collection('CallLogs').updateOne(
-                { call_id: callId },
+                {
+                    $or: [{ contact_id: contactId }, { contact_id: new ObjectId(contactId) }]
+                },
                 {
                     $set: {
                         creditsDeducted: true,
                         creditsDeductedAmount: cost,
                         duration: durationInSeconds,
-                        campaign_id: campaign._id,
-                        contact_id: new ObjectId(contactId),
+                        call_id: callId,
                         processedAt: new Date(),
                         updatedAt: new Date()
                     }
@@ -454,16 +582,29 @@ export class CallWorker {
 
             console.log(`✅ [Worker] Post-call actions completed for ${callId}. Cost: ${cost}`);
 
+            // 8. Trigger Call Analysis API
+            if (callId && !callId.startsWith('call_')) {
+                try {
+                    console.log(`🧠 [Worker] Triggering Analysis API for Call ID: ${callId}...`);
+                    const analysisUrl = `http://72.60.221.48:5000/analyze/call/${callId}`;
+                    const analysisResponse = await fetch(analysisUrl, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' }
+                    });
+
+                    if (analysisResponse.ok) {
+                        console.log(`✅ [Worker] Analysis API triggered successfully for ${callId}`);
+                    } else {
+                        const errText = await analysisResponse.text();
+                        console.warn(`⚠️ [Worker] Analysis API failed for ${callId}:`, errText);
+                    }
+                } catch (analysisError) {
+                    console.error(`❌ [Worker] Error triggering Analysis API:`, analysisError.message);
+                }
+            }
+
         } catch (error) {
             console.error(`❌ [Worker] triggerPostCallActions CRITICAL ERROR:`, error.message);
-        }
-
-        // 8. Trigger Analysis API (Async)
-        const analysisUrl = config.analysis?.apiUrl;
-        if (analysisUrl && callId && !callId.startsWith('call_')) {
-            console.log(`📊 [Worker] Dispatching analysis for ${callId}...`);
-            fetch(`${analysisUrl}/${callId}`, { method: 'GET' })
-                .catch(err => console.error(`❌ [Worker] Analysis API error:`, err.message));
         }
     }
 }

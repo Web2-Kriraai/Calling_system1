@@ -1,4 +1,4 @@
-import { getDb, createQueue, calculatePriority } from 'shared-lib';
+import { getDb, createQueue, calculatePriority, isWithinBusinessHours } from 'shared-lib';
 import { ObjectId } from 'mongodb';
 
 export class Scheduler {
@@ -19,7 +19,8 @@ export class Scheduler {
 
         // 1. Find active campaigns
         const activeCampaigns = await db.collection('campaigns').find({
-            status: 'active'
+            status: 'active',
+            archive: { $ne: true }
         }).toArray();
 
         console.log(`🔍 [Scheduler] Found ${activeCampaigns.length} active campaigns.`);
@@ -43,7 +44,8 @@ export class Scheduler {
 
         // Only find campaigns that are NOT active, completed, paused, or failed
         const scheduledCampaigns = await db.collection('campaigns').find({
-            status: { $nin: ['active', 'completed', 'paused', 'failed', 'invalid_configuration'] },
+            status: { $nin: ['active', 'completed', 'paused', 'failed'] },
+            archive: { $ne: true },
             startDate: { $lte: currentDate }
         }).toArray();
 
@@ -53,21 +55,28 @@ export class Scheduler {
                 (campaign.startDate === currentDate && campaign.startTime <= currentTime);
 
             if (isTimeReached) {
-                // Perform field validation before activation
+                // 1. Perform field validation before activation
                 const { isValid, missingFields } = this.validateCampaignConfig(campaign);
 
                 if (!isValid) {
-                    console.warn(`⚠️ [Scheduler] Campaign ${campaign.campaignName} (${campaign._id}) missing fields: ${missingFields.join(', ')}`);
+                    console.warn(`[Scheduler] Campaign ${campaign.campaignName} (${campaign._id}) missing fields: ${missingFields.join(', ')}`);
                     await db.collection('campaigns').updateOne(
                         { _id: campaign._id },
                         {
                             $set: {
-                                status: 'invalid_configuration',
+                                status: 'draft',
                                 error: `Missing required fields: ${missingFields.join(', ')}`,
                                 updatedAt: new Date()
                             }
                         }
                     );
+                    continue;
+                }
+
+                // 2. Check if contacts exist for this campaign
+                const contactExists = await db.collection('contactprocessings').findOne({ campaignId: campaign._id });
+                if (!contactExists) {
+                    console.warn(`[Scheduler] Campaign ${campaign.campaignName} (${campaign._id}) has no contacts. Skipping activation.`);
                     continue;
                 }
 
@@ -88,7 +97,9 @@ export class Scheduler {
             { field: 'startDate', label: 'Start Date' },
             { field: 'startTime', label: 'Start Time' },
             { field: 'concurrentCalls', label: 'Concurrent Calls' },
-            { field: 'createdBy', label: 'Created By' }
+            { field: 'createdBy', label: 'Created By' },
+            { field: 'agentName', label: 'Agent Name' },
+            { field: 'selectedVoice', label: 'Selected Voice' }
         ];
 
         // Check for business hours either in 'callingHours' or 'businessHours'
@@ -113,6 +124,11 @@ export class Scheduler {
      * Processes a single campaign by scanning pending contacts.
      */
     async processCampaign(campaign, db) {
+        if (!isWithinBusinessHours(campaign)) {
+            // console.log(`🕒 [Scheduler] Campaign ${campaign.campaignName} (${campaign._id}) is currently outside calling hours. Skipping.`);
+            return;
+        }
+
         console.log(`📡 [Scheduler] Processing campaign: ${campaign.campaignName} (${campaign._id})`);
 
         const now = new Date();
@@ -163,6 +179,27 @@ export class Scheduler {
 
         if (batch.length > 0) {
             await this.enqueueBatch(batch);
+        }
+
+        // 3. Final Step: Check if the campaign is now fully completed
+        // Count contacts that are NOT in a final state (completed or failed)
+        const pendingCount = await db.collection('contactprocessings').countDocuments({
+            campaignId: campaign._id,
+            status: { $nin: ['completed', 'failed'] }
+        });
+
+        if (pendingCount === 0) {
+            console.log(`🏁 [Scheduler] Campaign ${campaign.campaignName} (${campaign._id}) is fully completed.`);
+            await db.collection('campaigns').updateOne(
+                { _id: campaign._id },
+                {
+                    $set: {
+                        status: 'completed',
+                        completedAt: new Date(),
+                        updatedAt: new Date()
+                    }
+                }
+            );
         }
     }
 
