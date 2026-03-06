@@ -389,7 +389,7 @@ export class CallWorker {
             // 1.1 Use a short polling loop to wait for the webhook to create the CallLog
             // This fixes the race condition where triggerPostCallActions starts before the webhook finishes.
             let callLog = null;
-            const maxPollTime = 5000; // Wait up to 5 seconds
+            const maxPollTime = 20000; // Increased to 20 seconds to handle webhook delays
             const pollInterval = 1000; // Check every 1 second
             const pollStart = Date.now();
 
@@ -403,18 +403,24 @@ export class CallWorker {
                 });
 
                 if (callLog) break;
+
+                // Add a log every 3 seconds to avoid spamming but show progress
+                if (Math.floor((Date.now() - pollStart) / 1000) % 3 === 0) {
+                    console.log(`⏳ [Worker] Still waiting for CallLog for ${contactId}... (${Math.round((Date.now() - pollStart) / 1000)}s)`);
+                }
+
                 await new Promise(resolve => setTimeout(resolve, pollInterval));
             }
 
-            console.log("CallLog ::::::", callLog);
+            console.log("CallLog found/timeout ::::::", callLog ? "FOUND" : "NULL");
 
             if (callLog) {
                 callId = callLog.call_id || callId;
                 const completedEvent = callLog.call_data?.events?.find(e => e.event_type === 'call.completed');
                 duration = completedEvent?.data?.data?.duration || 0;
-                console.log(`📄 [Worker] Found CallLog for ${contactId}. Verified Duration: ${duration}ms`);
+                console.log(`📄 [Worker] Found CallLog for ${contactId}. Verified Duration: ${duration}ms, CallID: ${callId}`);
             } else {
-                console.warn(`⚠️ [Worker] No CallLog found for ${contactId} after 5s wait. Falling back to API response duration.`);
+                console.warn(`⚠️ [Worker] No CallLog found for ${contactId} after 20s wait. Falling back to API response duration.`);
                 duration = apiResponse.call?.duration || apiResponse.duration || 0;
             }
         } catch (logError) {
@@ -453,11 +459,31 @@ export class CallWorker {
                 const targetPackageId = tierToId[currentTier] || 'starter';
 
                 const pkg = await db.collection('creditpackages').findOne({ packageId: targetPackageId });
-                if (pkg && typeof pkg.pricePerMinute === 'number') {
-                    ratePerMinute = pkg.pricePerMinute;
+
+                // Determine if we should use Basic Model Price vs Standard Price
+                const isBasicVoice = campaign.selectedVoice?.tier === 'basic';
+
+                if (pkg) {
+                    if (isBasicVoice && typeof pkg.basicModelPrice === 'number') {
+                        ratePerMinute = pkg.basicModelPrice;
+                        console.log(`🎙️ [Worker] Using Basic Voice Rate: ${ratePerMinute} for ${targetPackageId}`);
+                    } else if (typeof pkg.pricePerMinute === 'number') {
+                        ratePerMinute = pkg.pricePerMinute;
+                        console.log(`🎙️ [Worker] Using Standard Voice Rate: ${ratePerMinute} for ${targetPackageId}`);
+                    } else {
+                        // Fallback within package
+                        ratePerMinute = isBasicVoice ? 0.05 : 0.08;
+                    }
                 } else {
-                    const fallbackRates = { 'A': 0.08, 'B': 0.075, 'C': 0.07, 'D': 0.065 };
-                    ratePerMinute = fallbackRates[currentTier] || 0.08;
+                    // Global Fallbacks if package is missing
+                    const fallbackPremium = { 'A': 0.08, 'B': 0.075, 'C': 0.07, 'D': 0.065 };
+                    const fallbackBasic = { 'A': 0.05, 'B': 0.045, 'C': 0.04, 'D': 0.035 };
+
+                    ratePerMinute = isBasicVoice ?
+                        (fallbackBasic[currentTier] || 0.05) :
+                        (fallbackPremium[currentTier] || 0.08);
+
+                    console.log(`🎙️ [Worker] Package not found. Using fallback ${isBasicVoice ? 'Basic' : 'Premium'} rate: ${ratePerMinute}`);
                 }
             } catch (pricingError) {
                 console.warn(`[Worker] Pricing lookup error, using fallback 0.08:`, pricingError.message);
