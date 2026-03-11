@@ -333,9 +333,9 @@ export class CallWorker {
 
         let url;
         if (tier === 'basic') {
-            url = process.env.CALL_API_BASIC_URL || 'http://72.60.221.48:8000/api/v1/calls/initiate-campaign-call';
+            url = process.env.CALL_API_BASIC_URL || 'https://imelda-vindictive-semicolloquially.ngrok-free.dev/api/v1/calls/initiate-campaign-call';
         } else {
-            url = process.env.CALL_API_PREMIUM_URL || 'http://72.60.221.48:8000/api/v1/calls/initiate-campaign-call';
+            url = process.env.CALL_API_PREMIUM_URL || 'https://imelda-vindictive-semicolloquially.ngrok-free.dev/api/v1/calls/initiate-campaign-call';
         }
 
         const payload = {
