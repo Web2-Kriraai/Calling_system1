@@ -80,3 +80,39 @@ export function calculatePriority(campaign, contact) {
 
     return Math.max(1, priority);
 }
+/**
+ * Parses a string time from IST into a UTC Date object.
+ * Handles formats like "2026-03-12 10:00 AM", "10:00 AM" (assumes today), or ISO strings.
+ * @param {string} timeStr 
+ * @returns {Date|null}
+ */
+export function parseISTTimeToDate(timeStr) {
+    if (!timeStr) return null;
+
+    try {
+        // First try luxon to parse it as IST
+        let dt;
+
+        // If it's just a time like "10:00 AM", prepend today's date in IST
+        if (/^\d{1,2}:\d{2}\s*(AM|PM)$/i.test(timeStr.trim())) {
+            const todayIST = DateTime.now().setZone('Asia/Kolkata').toISODate();
+            dt = DateTime.fromFormat(`${todayIST} ${timeStr.trim()}`, 'yyyy-MM-dd h:mm a', { zone: 'Asia/Kolkata' });
+        } else if (/^\d{4}-\d{2}-\d{2}\s+\d{1,2}:\d{2}\s*(AM|PM)$/i.test(timeStr.trim())) {
+            dt = DateTime.fromFormat(timeStr.trim(), 'yyyy-MM-dd h:mm a', { zone: 'Asia/Kolkata' });
+        } else if (/^\d{2}-\d{2}-\d{4}\s+\d{1,2}:\d{2}$/.test(timeStr.trim())) {
+            // New format: "11-03-2026 15:33"
+            dt = DateTime.fromFormat(timeStr.trim(), 'dd-MM-yyyy HH:mm', { zone: 'Asia/Kolkata' });
+        } else {
+            // Fallback to standard ISO parsing if possible
+            dt = DateTime.fromISO(timeStr, { zone: 'Asia/Kolkata' });
+        }
+
+        if (dt.isValid) {
+            return dt.toJSDate();
+        }
+    } catch (error) {
+        console.error(`❌ [Utils] Error parsing IST time "${timeStr}":`, error.message);
+    }
+
+    return null;
+}

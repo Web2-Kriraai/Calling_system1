@@ -1,4 +1,4 @@
-import { getDb, createQueue, calculatePriority, isWithinBusinessHours } from 'shared-lib';
+import { getDb, createQueue, calculatePriority, isWithinBusinessHours, parseISTTimeToDate } from 'shared-lib';
 import { ObjectId } from 'mongodb';
 
 export class Scheduler {
@@ -19,6 +19,9 @@ export class Scheduler {
 
         // 0b. Activate scheduled campaigns whose time has arrived
         await this.activateScheduledCampaigns(db);
+
+        // 0c. Process call analysis results for follow-ups
+        await this.processFollowUps(db);
 
         // 1. Find active campaigns
         const activeCampaigns = await db.collection('campaigns').find({
@@ -118,40 +121,55 @@ export class Scheduler {
         const currentDate = istTime.toISOString().split('T')[0];
         const currentTime = istTime.toISOString().split('T')[1].split('.')[0];
 
-        console.log(`🕒 [Scheduler] Checking for campaigns to activate... (Current IST: ${currentDate} ${currentTime})`);
+        console.log(`🕒 [Scheduler] Checking for campaigns to activate or schedule... (Current IST: ${currentDate} ${currentTime})`);
 
-        // Only find campaigns that are NOT active, completed, paused, or failed
-        const scheduledCampaigns = await db.collection('campaigns').find({
+        // Find campaigns that are waiting to be activated (not active, completed, paused, or failed)
+        const pendingCampaigns = await db.collection('campaigns').find({
             status: { $nin: ['active', 'completed', 'paused', 'failed'] },
-            archive: { $ne: true },
-            startDate: { $lte: currentDate }
+            archive: { $ne: true }
         }).toArray();
 
-        for (const campaign of scheduledCampaigns) {
+        for (const campaign of pendingCampaigns) {
+            const campaignId = campaign._id;
+
+            // 1. Check if the campaign script has been generated yet
+            // This is a prerequisite for both Scheduled and Active statuses
+            const script = await db.collection('campaign_scripts').findOne({
+                $or: [
+                    { campaignId: campaignId },
+                    { campaignId: campaignId.toString() }
+                ]
+            });
+
+            if (!script) {
+                // Keep status as 'processing' (or whatever it was) until script is ready
+                continue;
+            }
+
+            // 2. Perform field validation
+            const { isValid, missingFields } = this.validateCampaignConfig(campaign);
+            if (!isValid) {
+                console.warn(`[Scheduler] Campaign ${campaign.campaignName} (${campaignId}) missing fields: ${missingFields.join(', ')}`);
+                await db.collection('campaigns').updateOne(
+                    { _id: campaignId },
+                    {
+                        $set: {
+                            status: 'draft',
+                            error: `Missing required fields: ${missingFields.join(', ')}`,
+                            updatedAt: new Date()
+                        }
+                    }
+                );
+                continue;
+            }
+
+            // 3. Check if it's time to activate
             // If date is today, check time. If date is past, activate immediately.
             const isTimeReached = campaign.startDate < currentDate ||
                 (campaign.startDate === currentDate && campaign.startTime <= currentTime);
 
             if (isTimeReached) {
-                // 1. Perform field validation before activation
-                const { isValid, missingFields } = this.validateCampaignConfig(campaign);
-
-                if (!isValid) {
-                    console.warn(`[Scheduler] Campaign ${campaign.campaignName} (${campaign._id}) missing fields: ${missingFields.join(', ')}`);
-                    await db.collection('campaigns').updateOne(
-                        { _id: campaign._id },
-                        {
-                            $set: {
-                                status: 'draft',
-                                error: `Missing required fields: ${missingFields.join(', ')}`,
-                                updatedAt: new Date()
-                            }
-                        }
-                    );
-                    continue;
-                }
-
-                // 2. Check if contacts exist for this campaign
+                // Check if contacts exist for this campaign
                 const contactExists = await db.collection('contactprocessings').findOne({ campaignId: campaign._id });
                 if (!contactExists) {
                     console.warn(`[Scheduler] Campaign ${campaign.campaignName} (${campaign._id}) has no contacts. Skipping activation.`);
@@ -162,6 +180,13 @@ export class Scheduler {
                 await db.collection('campaigns').updateOne(
                     { _id: campaign._id },
                     { $set: { status: 'active', activatedAt: new Date(), updatedAt: new Date() } }
+                );
+            } else if (campaign.status !== 'scheduled') {
+                // Script is ready, but time not reached -> Set to Scheduled
+                console.log(`🕒 [Scheduler] Script ready for campaign ${campaign.campaignName} (${campaignId}), setting status to scheduled.`);
+                await db.collection('campaigns').updateOne(
+                    { _id: campaignId },
+                    { $set: { status: 'scheduled', updatedAt: new Date() } }
                 );
             }
         }
@@ -249,7 +274,7 @@ export class Scheduler {
         const contactCursor = db.collection('contactprocessings').find({
             campaignId: campaign._id,
             $or: [
-                { status: { $in: ['pending', 'enqueued'] } },
+                { status: { $in: ['pending', 'enqueued'] }, $or: [{ scheduledAt: { $exists: false } }, { scheduledAt: { $lte: now } }] },
                 {
                     status: 'retry',
                     nextRetryAt: { $lte: now }
@@ -331,6 +356,99 @@ export class Scheduler {
             );
         } catch (error) {
             console.error('❌ [Scheduler] Error enqueuing batch:', error.message);
+        }
+    }
+
+    /**
+     * Scans call_analysis for results that indicate a follow-up call is needed.
+     */
+    async processFollowUps(db) {
+        try {
+            // Find analysis records from the last 6 hours that indicate a follow-up is needed and haven't been processed.
+            const sixHoursAgo = new Date(Date.now() - 6 * 60 * 60 * 1000);
+
+            const analysesToProcess = await db.collection('call_analysis').find({
+                'analysis_data.Next_Action.Type': { $regex: /^call$/i },
+                followUpProcessed: { $ne: true },
+                created_at: { $gte: sixHoursAgo }
+            }).toArray();
+
+            if (analysesToProcess.length === 0) return;
+
+            console.log(`🧠 [Scheduler] Found ${analysesToProcess.length} recent follow-up analysis records to process.`);
+
+            for (const analysis of analysesToProcess) {
+                try {
+                    const { contact_id, campaign_id, analysis_data } = analysis;
+
+                    if (!contact_id || !campaign_id) {
+                        console.warn(`⚠️ [Scheduler] Skipping follow-up for analysis ${analysis._id} due to missing IDs.`);
+                        await db.collection('call_analysis').updateOne({ _id: analysis._id }, { $set: { followUpProcessed: true, followUpError: 'missing_ids' } });
+                        continue;
+                    }
+
+                    // 1. Check if campaign has follow-ups enabled
+                    const campaign = await db.collection('campaigns').findOne({ _id: new ObjectId(campaign_id) });
+                    if (!campaign || campaign.followup !== true) {
+                        console.log(`ℹ️ [Scheduler] Follow-up NOT enabled for campaign ${campaign_id}. Marking analysis as processed.`);
+                        await db.collection('call_analysis').updateOne({ _id: analysis._id }, { $set: { followUpProcessed: true } });
+                        continue;
+                    }
+
+                    // 2. Determine scheduled time
+                    const nextAction = analysis_data?.Next_Action;
+                    let scheduledTime;
+                    const analysisTime = nextAction?.Scheduled_Time || analysis.time;
+
+                    if (analysisTime) {
+                        scheduledTime = parseISTTimeToDate(analysisTime);
+                        if (!scheduledTime) {
+                            console.warn(`⚠️ [Scheduler] Could not parse follow-up time "${analysisTime}" for analysis ${analysis._id}. Falling back to 30 mins.`);
+                            scheduledTime = new Date(Date.now() + 30 * 60 * 1000);
+                        }
+                    } else {
+                        console.log(`ℹ️ [Scheduler] No follow-up time in analysis ${analysis._id}. Defaulting to 30 minutes.`);
+                        scheduledTime = new Date(Date.now() + 30 * 60 * 1000);
+                    }
+
+                    // 3. Fetch the original contact to duplicate its data
+                    const originalContact = await db.collection('contactprocessings').findOne({ _id: new ObjectId(contact_id) });
+                    if (!originalContact) {
+                        console.warn(`⚠️ [Scheduler] Original contact ${contact_id} not found for follow-up analysis ${analysis._id}.`);
+                        await db.collection('call_analysis').updateOne({ _id: analysis._id }, { $set: { followUpProcessed: true, followUpError: 'contact_not_found' } });
+                        continue;
+                    }
+
+                    // 4. Create a new contact processing entry for the follow-up
+                    const { _id, ...contactDataWithoutId } = originalContact;
+                    const followUpEntry = {
+                        ...contactDataWithoutId,
+                        status: 'pending',
+                        callReceiveStatus: 0,
+                        retryCount: 0,
+                        callAttempts: [],
+                        scheduledAt: scheduledTime,
+                        parentId: _id,
+                        isFollowUp: true,
+                        createdAt: new Date(),
+                        updatedAt: new Date()
+                    };
+
+                    await db.collection('contactprocessings').insertOne(followUpEntry);
+
+                    // 5. Mark analysis as processed
+                    await db.collection('call_analysis').updateOne(
+                        { _id: analysis._id },
+                        { $set: { followUpProcessed: true, followUpScheduledAt: scheduledTime } }
+                    );
+
+                    console.log(`✅ [Scheduler] Scheduled follow-up for contact ${contact_id} at ${scheduledTime.toISOString()} based on analysis ${analysis._id}.`);
+                } catch (err) {
+                    console.error(`❌ [Scheduler] Error processing analysis record ${analysis._id}:`, err.message);
+                }
+            }
+        } catch (error) {
+            console.error('❌ [Scheduler] processFollowUps failed:', error.message);
         }
     }
 }
