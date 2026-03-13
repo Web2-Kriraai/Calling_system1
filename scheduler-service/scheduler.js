@@ -44,8 +44,12 @@ export class Scheduler {
      */
     async activateImmediateStartCampaigns(db) {
         // Find all immediateStart campaigns that are still waiting to be activated
+        // We now also check for customizeSchedule: false as a synonym for immediateStart: true
         const pendingCampaigns = await db.collection('campaigns').find({
-            immediateStart: true,
+            $or: [
+                { immediateStart: true },
+                { customizeSchedule: false }
+            ],
             status: { $nin: ['active', 'completed', 'paused', 'failed'] },
             archive: { $ne: true }
         }).toArray();
@@ -121,19 +125,22 @@ export class Scheduler {
         const currentDate = istTime.toISOString().split('T')[0];
         const currentTime = istTime.toISOString().split('T')[1].split('.')[0];
 
-        console.log(`🕒 [Scheduler] Checking for campaigns to activate or schedule... (Current IST: ${currentDate} ${currentTime})`);
+        // console.log(`🕒 [Scheduler] Checking for campaigns to activate or schedule... (Current IST: ${currentDate} ${currentTime})`);
 
-        // Find campaigns that are waiting to be activated (not active, completed, paused, or failed)
-        const pendingCampaigns = await db.collection('campaigns').find({
-            status: { $nin: ['active', 'completed', 'paused', 'failed'] },
+        // Find campaigns that are scheduled or active (to verify if they should still be active)
+        const candidates = await db.collection('campaigns').find({
+            status: { $in: ['active', 'scheduled', 'processing', 'draft', 'error', 'pending'] },
             archive: { $ne: true }
         }).toArray();
 
-        for (const campaign of pendingCampaigns) {
+        for (const campaign of candidates) {
             const campaignId = campaign._id;
 
+            // Skip immediateStart campaigns here as they are handled by activateImmediateStartCampaigns
+            const isImmediate = campaign.immediateStart === true || campaign.customizeSchedule === false;
+            if (isImmediate) continue;
+
             // 1. Check if the campaign script has been generated yet
-            // This is a prerequisite for both Scheduled and Active statuses
             const script = await db.collection('campaign_scripts').findOne({
                 $or: [
                     { campaignId: campaignId },
@@ -169,21 +176,24 @@ export class Scheduler {
                 (campaign.startDate === currentDate && campaign.startTime <= currentTime);
 
             if (isTimeReached) {
-                // Check if contacts exist for this campaign
-                const contactExists = await db.collection('contactprocessings').findOne({ campaignId: campaign._id });
-                if (!contactExists) {
-                    console.warn(`[Scheduler] Campaign ${campaign.campaignName} (${campaign._id}) has no contacts. Skipping activation.`);
-                    continue;
-                }
+                // Only activate if not already active
+                if (campaign.status !== 'active') {
+                    // Check if contacts exist for this campaign
+                    const contactExists = await db.collection('contactprocessings').findOne({ campaignId: campaign._id });
+                    if (!contactExists) {
+                        console.warn(`[Scheduler] Campaign ${campaign.campaignName} (${campaign._id}) has no contacts. Skipping activation.`);
+                        continue;
+                    }
 
-                console.log(`✨ [Scheduler] Activating campaign: ${campaign.campaignName} (${campaign._id})`);
-                await db.collection('campaigns').updateOne(
-                    { _id: campaign._id },
-                    { $set: { status: 'active', activatedAt: new Date(), updatedAt: new Date() } }
-                );
+                    console.log(`✨ [Scheduler] Activating campaign: ${campaign.campaignName} (${campaign._id})`);
+                    await db.collection('campaigns').updateOne(
+                        { _id: campaign._id },
+                        { $set: { status: 'active', activatedAt: new Date(), updatedAt: new Date() } }
+                    );
+                }
             } else if (campaign.status !== 'scheduled') {
-                // Script is ready, but time not reached -> Set to Scheduled
-                console.log(`🕒 [Scheduler] Script ready for campaign ${campaign.campaignName} (${campaignId}), setting status to scheduled.`);
+                // Start time not reached or campaign was prematurely set to active -> Set to Scheduled
+                console.log(`🕒 [Scheduler] Campaign ${campaign.campaignName} (${campaignId}) start time not reached. Setting status to scheduled.`);
                 await db.collection('campaigns').updateOne(
                     { _id: campaignId },
                     { $set: { status: 'scheduled', updatedAt: new Date() } }
@@ -197,8 +207,9 @@ export class Scheduler {
      */
     validateCampaignConfig(campaign) {
         // immediateStart campaigns don't need startDate/startTime — they activate on script readiness
+        const isImmediate = campaign.immediateStart === true || campaign.customizeSchedule === false;
         const requiredFields = [
-            ...(!campaign.immediateStart ? [
+            ...(!isImmediate ? [
                 { field: 'startDate', label: 'Start Date' },
                 { field: 'startTime', label: 'Start Time' }
             ] : []),
