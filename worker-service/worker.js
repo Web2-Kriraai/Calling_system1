@@ -487,6 +487,18 @@ export class CallWorker {
         // Fallback Call ID if still missing
         callId = callId || `call_${Date.now()}`;
 
+        // Resolve which CallLog doc to update: by call_id (current attempt) so we don't update an older attempt for same contact
+        let callLogUpdateFilter = null;
+        if (callId && !callId.startsWith('call_')) {
+            callLogUpdateFilter = { call_id: callId };
+        } else {
+            const latestByContact = await db.collection('CallLogs').findOne(
+                { $or: [{ contact_id: contactId }, { contact_id: new ObjectId(contactId) }] },
+                { sort: { createdAt: -1 }, projection: { _id: 1 } }
+            );
+            if (latestByContact) callLogUpdateFilter = { _id: latestByContact._id };
+        }
+
         console.log(`💰 [Worker] Processing credit deduction for Call ID: ${callId} (Duration: ${duration}s)...`);
 
         try {
@@ -578,20 +590,19 @@ export class CallWorker {
             // 4. Atomic Credit Deduction
             if (user.credits < cost) {
                 console.warn(`⚠️ [Worker] Insufficient credits for ${user.email}. Cost: ${cost}, Balance: ${user.credits}`);
-                await db.collection('CallLogs').updateOne(
-                    {
-                        $or: [{ contact_id: contactId }, { contact_id: new ObjectId(contactId) }]
-                    },
-                    {
-                        $set: {
-                            creditsDeducted: false,
-                            creditDeductionError: 'insufficient_credits',
-                            processedAt: new Date(),
-                            updatedAt: new Date()
+                if (callLogUpdateFilter) {
+                    await db.collection('CallLogs').updateOne(
+                        callLogUpdateFilter,
+                        {
+                            $set: {
+                                creditsDeducted: false,
+                                creditDeductionError: 'insufficient_credits',
+                                processedAt: new Date(),
+                                updatedAt: new Date()
+                            }
                         }
-                    },
-                    { upsert: true }
-                );
+                    );
+                }
                 return;
             }
 
@@ -644,23 +655,22 @@ export class CallWorker {
                 { upsert: true }
             );
 
-            // 7. Update Call Log
-            await db.collection('CallLogs').updateOne(
-                {
-                    $or: [{ contact_id: contactId }, { contact_id: new ObjectId(contactId) }]
-                },
-                {
-                    $set: {
-                        creditsDeducted: true,
-                        creditsDeductedAmount: cost,
-                        duration: durationInSeconds,
-                        call_id: callId,
-                        processedAt: new Date(),
-                        updatedAt: new Date()
+            // 7. Update Call Log (by call_id so we update the current attempt, not a previous one for same contact)
+            if (callLogUpdateFilter) {
+                await db.collection('CallLogs').updateOne(
+                    callLogUpdateFilter,
+                    {
+                        $set: {
+                            creditsDeducted: true,
+                            creditsDeductedAmount: cost,
+                            duration: durationInSeconds,
+                            call_id: callId,
+                            processedAt: new Date(),
+                            updatedAt: new Date()
+                        }
                     }
-                },
-                { upsert: true }
-            );
+                );
+            }
 
             console.log(`✅ [Worker] Post-call actions completed for ${callId}. Cost: ${cost}`);
 
