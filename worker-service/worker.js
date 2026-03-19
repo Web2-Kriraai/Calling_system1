@@ -105,6 +105,7 @@ export class CallWorker {
 
         let shouldReleaseSlot = true; // Declare here so it is accessible in finally{}
         let currentlyHoldingSlot = false;
+        let attemptStartedAt = 0; // Set right after executeCall; used for nextRetryAt so delay is from attempt start, not poll end
 
         try {
             // 3. Update Status to 'processing'
@@ -123,6 +124,7 @@ export class CallWorker {
 
             // 5. Execute API Call
             const result = await this.executeCall(job.data);
+            attemptStartedAt = Date.now(); // Capture once; used for nextRetryAt and callAttempts timestamp (retry delay from attempt start)
             currentlyHoldingSlot = true; // Still holding the slot from the initiation acquisition
 
             // 6. Polling Logic: Wait for the API to register the call (Status 1, 2, or 3)
@@ -242,10 +244,12 @@ export class CallWorker {
                     console.error(`⚠️ [Worker] Post-call actions failed:`, triggerError.message);
                 }
             } else {
-                // FAILED (0) or NOT RECEIVED (1): Retry if possible, release slot.
+                // FAILED (0) or NOT RECEIVED (1): Persist immediately; nextRetryAt from attempt start so delay is not inflated by polling
                 const isRetryable = currentRetryCount + 1 < maxRetries;
                 const nextStatus = isRetryable ? 'retry' : 'failed';
-                const nextRetryAt = isRetryable ? new Date(Date.now() + retryDelayMinutes * 60000) : null;
+                const baseTime = attemptStartedAt > 0 ? attemptStartedAt : Date.now();
+                const nextRetryAt = isRetryable ? new Date(baseTime + retryDelayMinutes * 60000) : null;
+                const attemptTimestamp = new Date(attemptStartedAt > 0 ? attemptStartedAt : Date.now());
 
                 await db.collection('contactprocessings').updateOne(
                     { _id: contactObjId },
@@ -260,7 +264,7 @@ export class CallWorker {
                         $push: {
                             callAttempts: {
                                 attempt: currentAttempts,
-                                timestamp: new Date(),
+                                timestamp: attemptTimestamp,
                                 status: nextStatus,
                                 message: callStatus === 1 ? 'Not Received' : 'API Attempt Failed'
                             }
@@ -477,13 +481,13 @@ export class CallWorker {
             }
         } catch (logError) {
             console.error(`❌ [Worker] Error fetching CallLog:`, logError.message);
-            duration = apiResponse.call?.duration || apiResponse.duration || 0;
+            duration = (apiResponse.call?.duration || apiResponse.duration || 0) / 1000; // API usually returns ms, convert to s
         }
 
         // Fallback Call ID if still missing
         callId = callId || `call_${Date.now()}`;
 
-        console.log(`💰 [Worker] Processing credit deduction for Call ID: ${callId} (Duration: ${duration}ms)...`);
+        console.log(`💰 [Worker] Processing credit deduction for Call ID: ${callId} (Duration: ${duration}s)...`);
 
         try {
             // 1. Fetch Campaign and User
