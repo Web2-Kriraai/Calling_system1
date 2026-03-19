@@ -274,7 +274,7 @@ export class Scheduler {
                 // Fallback: sum all phone concurrentCalls for this user (if no phoneRef on campaign)
                 const totalLimit = campaignUser.phoneNumbers.reduce((sum, p) => sum + (p.concurrentCalls || 0), 0);
                 userConcurrentLimit = totalLimit || campaign.concurrentCalls || 10;
-                console.log(`� [Scheduler] No phone match found. Using total/fallback limit: ${userConcurrentLimit}`);
+                console.log(`📞 [Scheduler] No phone match found. Using total/fallback limit: ${userConcurrentLimit}`);
             }
         } else {
             userConcurrentLimit = campaign.concurrentCalls || 10;
@@ -339,17 +339,37 @@ export class Scheduler {
         });
 
         if (pendingCount === 0) {
-            console.log(`🏁 [Scheduler] Campaign ${campaign.campaignName} (${campaign._id}) is fully completed.`);
-            await db.collection('campaigns').updateOne(
-                { _id: campaign._id },
-                {
-                    $set: {
-                        status: 'completed',
-                        completedAt: new Date(),
-                        updatedAt: new Date()
+            // If campaign uses Google Sheet with auto-sync, don't complete until autoSyncUntilDate
+            let canComplete = true;
+            if (campaign.googleSheetsDataId) {
+                try {
+                    const sheetDoc = await db.collection('googlesheetsdatas').findOne({
+                        _id: new ObjectId(campaign.googleSheetsDataId)
+                    });
+                    if (sheetDoc?.autoSyncEnabled === true && sheetDoc?.autoSyncUntilDate) {
+                        const until = new Date(sheetDoc.autoSyncUntilDate);
+                        if (Date.now() < until.getTime()) {
+                            canComplete = false;
+                            console.log(`📅 [Scheduler] Campaign ${campaign.campaignName} (${campaign._id}) has auto-sync until ${until.toISOString()}. Not marking completed yet.`);
+                        }
                     }
+                } catch (err) {
+                    console.warn(`[Scheduler] Could not check GoogleSheetsData for campaign ${campaign._id}:`, err.message);
                 }
-            );
+            }
+            if (canComplete) {
+                console.log(`🏁 [Scheduler] Campaign ${campaign.campaignName} (${campaign._id}) is fully completed.`);
+                await db.collection('campaigns').updateOne(
+                    { _id: campaign._id },
+                    {
+                        $set: {
+                            status: 'completed',
+                            completedAt: new Date(),
+                            updatedAt: new Date()
+                        }
+                    }
+                );
+            }
         }
     }
 
@@ -363,7 +383,7 @@ export class Scheduler {
             const contactIds = jobs.map(j => new ObjectId(j.data.contactId));
             await db.collection('contactprocessings').updateMany(
                 { _id: { $in: contactIds } },
-                { $set: { status: 'enqueued', enqueuedAt: new Date() } }
+                { $set: { status: 'enqueued' } }
             );
         } catch (error) {
             console.error('❌ [Scheduler] Error enqueuing batch:', error.message);
