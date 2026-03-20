@@ -32,6 +32,8 @@ export const config = {
     },
     queue: {
         name: 'outbound-calls',
+        /** BullMQ queue for billing / CallLog / analysis after a call completes (decoupled from main call worker) */
+        postCallName: process.env.POST_CALL_QUEUE_NAME || 'post-call-actions',
     },
     concurrency: {
         globalMax: 5000,

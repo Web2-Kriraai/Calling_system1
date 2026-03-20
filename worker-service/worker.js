@@ -5,12 +5,48 @@ import {
     concurrencyGuard,
     isWithinBusinessHours,
     queueName,
+    postCallQueueName,
+    createPostCallQueue,
     config
 } from 'shared-lib';
 import { ObjectId } from 'mongodb';
 
+const POST_CALL_DELAY_MS = parseInt(process.env.POST_CALL_DELAY_MS || '2500', 10);
+const POST_CALL_WORKER_CONCURRENCY = parseInt(process.env.POST_CALL_WORKER_CONCURRENCY || '500', 10);
+const ANALYSIS_API_MAX_ATTEMPTS = parseInt(process.env.ANALYSIS_API_MAX_ATTEMPTS || '5', 10);
+const ANALYSIS_API_RETRY_MS = parseInt(process.env.ANALYSIS_API_RETRY_MS || '3000', 10);
+const CALL_CREDIT_MAX_ATTEMPTS = parseInt(process.env.CALL_CREDIT_MAX_ATTEMPTS || '5', 10);
+const CALL_CREDIT_RETRY_MS = parseInt(process.env.CALL_CREDIT_RETRY_MS || '3000', 10);
+
+/**
+ * Billable duration (seconds) from CallLog events. Prefers call_answered + call_hangup timestamps, then cdr_push.Duration when ANSWER.
+ */
+function computeDurationFromEvents(events) {
+    if (!events || !Array.isArray(events)) return 0;
+    const hangup = events.find(e => e.event_type === 'call_hangup');
+    const answered = events.find(e => e.event_type === 'call_answered');
+    const cdrPush = events.find(e => e.event_type === 'cdr_push');
+
+    if (hangup?.data?.end_time && answered?.data?.answer_time) {
+        try {
+            const end = new Date(hangup.data.end_time);
+            const start = new Date(answered.data.answer_time);
+            return Math.max(0, Math.floor((end - start) / 1000));
+        } catch {
+            /* fall through */
+        }
+    }
+    if (cdrPush?.data?.CallStatus === 'ANSWER') {
+        const d = parseInt(cdrPush.data.Duration, 10);
+        if (!Number.isNaN(d) && d >= 0) return d;
+    }
+    return 0;
+}
+
 export class CallWorker {
     constructor() {
+        this.postCallQueue = createPostCallQueue();
+
         this.worker = new Worker(queueName, this.processJob.bind(this), {
             connection: getRedis(),
             concurrency: 2000, // Increased to allow more jobs to "wait" for campaign slots
@@ -26,6 +62,70 @@ export class CallWorker {
                 console.error(`❌ [Worker] Job ${job.id} failed:`, err.message);
             }
         });
+
+        // Dedicated worker for post-call (billing, CallLog, analysis) — frees main workers immediately after call completes
+        this.postCallWorker = new Worker(postCallQueueName, this.processPostCallJob.bind(this), {
+            connection: getRedis(),
+            concurrency: POST_CALL_WORKER_CONCURRENCY,
+            lockDuration: 180000, // 3 min: CallLog poll + analysis HTTP
+            limiter: {
+                max: 2000,
+                duration: 1000,
+            }
+        });
+
+        this.postCallWorker.on('failed', (job, err) => {
+            console.error(`❌ [PostCallWorker] Job ${job?.id} failed:`, err.message);
+        });
+    }
+
+    /**
+     * Enqueue post-call processing with delay so provider/webhook can persist CallLog before we run.
+     */
+    async enqueuePostCallJob(jobData, result) {
+        const { campaignId, contactId } = jobData;
+        const api = result?.apiResponse || {};
+        const apiCallId = api.call?.id || api.call_id || api.id || api.callId;
+        // BullMQ / Redis: custom jobId must not contain ":" — use hyphens only
+        const jobId =
+            apiCallId != null && !String(apiCallId).startsWith('call_')
+                ? `post-call-${campaignId}-${contactId}-${String(apiCallId)}`
+                : `post-call-${campaignId}-${contactId}-${Date.now()}`;
+
+        try {
+            await this.postCallQueue.add(
+                'post-call',
+                { jobData, apiResponse: api },
+                { jobId, delay: POST_CALL_DELAY_MS }
+            );
+            console.log(`📬 [Worker] Post-call job queued (${jobId}, delay ${POST_CALL_DELAY_MS}ms)`);
+        } catch (err) {
+            // Duplicate jobId while job still in queue — safe to ignore
+            if (String(err.message || '').toLowerCase().includes('already') || err.name === 'JobIdDuplicateError') {
+                console.log(`ℹ️ [Worker] Post-call job already exists for ${jobId}, skipping duplicate enqueue`);
+                return;
+            }
+            console.error(`❌ [Worker] Failed to enqueue post-call job:`, err.message);
+            throw err;
+        }
+    }
+
+    async processPostCallJob(job) {
+        const { jobData, apiResponse } = job.data || {};
+        if (!jobData || !jobData.contactId) {
+            console.warn(`⚠️ [PostCallWorker] Invalid post-call job payload, skipping`);
+            return;
+        }
+        const metadata = jobData.metadata || {};
+        await this.triggerPostCallActions(jobData, { apiResponse }, metadata, null);
+    }
+
+    async close() {
+        await Promise.all([
+            this.worker.close(),
+            this.postCallWorker.close(),
+            this.postCallQueue.close()
+        ]);
     }
 
     async processJob(job) {
@@ -237,11 +337,17 @@ export class CallWorker {
                 }
                 shouldReleaseSlot = false;
 
-                // Trigger post-call actions (billing/analysis)
+                // Post-call on dedicated queue (frees slot fast). Fallback inline if Redis/queue fails.
                 try {
-                    await this.triggerPostCallActions(job.data, result, metadata, updatedContact || currentContact);
+                    await this.enqueuePostCallJob(job.data, result);
                 } catch (triggerError) {
-                    console.error(`⚠️ [Worker] Post-call actions failed:`, triggerError.message);
+                    console.error(`⚠️ [Worker] Post-call enqueue failed, running inline:`, triggerError.message);
+                    try {
+                        await new Promise(r => setTimeout(r, POST_CALL_DELAY_MS));
+                        await this.triggerPostCallActions(job.data, result, metadata, updatedContact || currentContact);
+                    } catch (inlineErr) {
+                        console.error(`⚠️ [Worker] Inline post-call failed:`, inlineErr.message);
+                    }
                 }
             } else {
                 // FAILED (0) or NOT RECEIVED (1): Persist immediately; nextRetryAt from attempt start so delay is not inflated by polling
@@ -406,90 +512,124 @@ export class CallWorker {
         const apiResponse = result.apiResponse || {};
         const db = await getDb();
 
+        // Delay is applied when the post-call job is enqueued (BullMQ job.delay), not here — avoids blocking main workers
+
         // 1. Fetch Verified Duration from CallLogs
         let duration = 0;
         let callId = apiResponse.call?.id || apiResponse.call_id || apiResponse.id || apiResponse.callId;
+        const apiCallId = (callId && !String(callId).startsWith('call_')) ? callId : null;
+
+        let billingAttemptsUsed = 1;
 
         try {
-            // 1.1 Use a short polling loop to wait for the webhook to create the CallLog
-            // This fixes the race condition where triggerPostCallActions starts before the webhook finishes.
-            let callLog = null;
-            const maxPollTime = 20000; // Increased to 20 seconds to handle webhook delays
-            const pollInterval = 1000; // Check every 1 second
-            const pollStart = Date.now();
+            for (let creditAttempt = 1; creditAttempt <= CALL_CREDIT_MAX_ATTEMPTS; creditAttempt++) {
+                billingAttemptsUsed = creditAttempt;
+                duration = 0;
 
-            while (Date.now() - pollStart < maxPollTime) {
-                // Prioritize search by call_id if available, otherwise try contact_id
-                if (callId && !callId.startsWith('call_')) {
-                    callLog = await db.collection("CallLogs").findOne({ call_id: callId });
-                }
-
-                if (!callLog) {
-                    // Fallback to contact_id but get the MOST RECENT one
-                    callLog = await db.collection("CallLogs").findOne(
-                        {
-                            $or: [
-                                { contact_id: contactId },
-                                { contact_id: new ObjectId(contactId) }
-                            ]
-                        },
-                        { sort: { createdAt: -1 } }
+                if (creditAttempt > 1) {
+                    console.log(
+                        `🔄 [Worker] Credit billing attempt ${creditAttempt}/${CALL_CREDIT_MAX_ATTEMPTS} for call ${apiCallId || contactId} — duration was 0, waiting ${CALL_CREDIT_RETRY_MS}ms for CallLog/CDR events...`
                     );
+                    await new Promise(r => setTimeout(r, CALL_CREDIT_RETRY_MS));
                 }
 
-                if (callLog) break;
+                let callLog = null;
 
-                // Add a log every 3 seconds to avoid spamming but show progress
-                if (Math.floor((Date.now() - pollStart) / 1000) % 3 === 0) {
-                    console.log(`⏳ [Worker] Still waiting for CallLog for ${contactId}... (${Math.round((Date.now() - pollStart) / 1000)}s)`);
-                }
+                if (creditAttempt === 1) {
+                    const maxPollTime = 20000;
+                    const pollInterval = 1000;
+                    const pollStart = Date.now();
+                    let pollRound = 0;
 
-                await new Promise(resolve => setTimeout(resolve, pollInterval));
-            }
-
-            if (callLog) {
-                callId = callLog.call_id || callId;
-                const events = callLog.call_data?.events || [];
-                const cdrPush = events.find(e => e.event_type === 'cdr_push');
-
-                // 1.2 Determine status and duration from events
-                if (cdrPush?.data?.CallStatus === 'ANSWER') {
-                    const hangup = events.find(e => e.event_type === 'call_hangup');
-                    const answered = events.find(e => e.event_type === 'call_answered');
-
-                    if (hangup?.data?.end_time && answered?.data?.answer_time) {
-                        try {
-                            const end = new Date(hangup.data.end_time);
-                            const start = new Date(answered.data.answer_time);
-                            duration = Math.max(0, Math.floor((end - start) / 1000)); // Seconds
-                            console.log(`📄 [Worker] Calculated talking duration from events: ${duration}s`);
-                        } catch (calcError) {
-                            duration = parseInt(cdrPush.data.Duration) || 0;
-                            console.warn(`⚠️ [Worker] Error calculating duration from timestamps, using fallback Duration: ${duration}s`);
+                    while (Date.now() - pollStart < maxPollTime) {
+                        pollRound += 1;
+                        if (callId && !String(callId).startsWith('call_')) {
+                            callLog = await db.collection('CallLogs').findOne({ call_id: callId });
                         }
-                    } else {
-                        duration = parseInt(cdrPush.data.Duration) || 0;
-                        console.log(`📄 [Worker] Using fallback Duration from cdr_push: ${duration}s`);
+
+                        if (!callLog) {
+                            callLog = await db.collection('CallLogs').findOne(
+                                {
+                                    $or: [
+                                        { contact_id: contactId },
+                                        { contact_id: new ObjectId(contactId) }
+                                    ]
+                                },
+                                { sort: { createdAt: -1 } }
+                            );
+                        }
+
+                        if (callLog) break;
+
+                        if (Math.floor((Date.now() - pollStart) / 1000) % 3 === 0) {
+                            console.log(
+                                `⏳ [Worker] Still waiting for CallLog for ${contactId}... (${Math.round((Date.now() - pollStart) / 1000)}s, poll #${pollRound})`
+                            );
+                        }
+
+                        await new Promise(resolve => setTimeout(resolve, pollInterval));
                     }
                 } else {
-                    console.log(`📄 [Worker] Call not answered (Status: ${cdrPush?.data?.CallStatus || 'UNKNOWN'}). Setting duration to 0.`);
-                    duration = 0;
+                    if (apiCallId != null) {
+                        callLog = await db.collection('CallLogs').findOne({ call_id: apiCallId });
+                    }
+                    if (!callLog && callId && !String(callId).startsWith('call_')) {
+                        callLog = await db.collection('CallLogs').findOne({ call_id: callId });
+                    }
+                    if (!callLog) {
+                        callLog = await db.collection('CallLogs').findOne(
+                            {
+                                $or: [
+                                    { contact_id: contactId },
+                                    { contact_id: new ObjectId(contactId) }
+                                ]
+                            },
+                            { sort: { createdAt: -1 } }
+                        );
+                    }
                 }
-            } else {
-                console.warn(`⚠️ [Worker] No CallLog found for ${contactId} after 20s wait. Falling back to API response duration.`);
-                duration = (apiResponse.call?.duration || apiResponse.duration || 0) / 1000; // API usually returns ms, convert to s
+
+                if (callLog) {
+                    const isCurrentCall = apiCallId == null || String(callLog.call_id) === String(apiCallId);
+                    if (isCurrentCall) {
+                        if (apiCallId == null) callId = callLog.call_id || callId;
+                        const events = callLog.call_data?.events || [];
+                        duration = computeDurationFromEvents(events);
+                        if (duration > 0) {
+                            console.log(`📄 [Worker] Billable duration from events (attempt ${creditAttempt}/${CALL_CREDIT_MAX_ATTEMPTS}): ${duration}s`);
+                        } else if (events?.length) {
+                            console.log(
+                                `📄 [Worker] Duration still 0 after parsing ${events.length} event(s) (attempt ${creditAttempt}/${CALL_CREDIT_MAX_ATTEMPTS}) — CDR/hangup may arrive late`
+                            );
+                        }
+                    } else {
+                        duration = (apiResponse.call?.duration || apiResponse.duration || 0) / 1000;
+                    }
+                } else {
+                    duration = (apiResponse.call?.duration || apiResponse.duration || 0) / 1000;
+                    if (creditAttempt === 1) {
+                        console.warn(`⚠️ [Worker] No CallLog found for ${contactId} after 20s wait. Using API duration fallback.`);
+                    }
+                }
+
+                if (duration > 0) break;
+                if (creditAttempt >= CALL_CREDIT_MAX_ATTEMPTS) break;
+                if (!apiCallId) break;
             }
         } catch (logError) {
             console.error(`❌ [Worker] Error fetching CallLog:`, logError.message);
-            duration = (apiResponse.call?.duration || apiResponse.duration || 0) / 1000; // API usually returns ms, convert to s
+            duration = (apiResponse.call?.duration || apiResponse.duration || 0) / 1000;
         }
 
+        if (apiCallId != null) {
+            callId = apiCallId;
+        }
         // Fallback Call ID if still missing
         callId = callId || `call_${Date.now()}`;
 
         // Resolve which CallLog doc to update: by call_id (current attempt) so we don't update an older attempt for same contact
         let callLogUpdateFilter = null;
-        if (callId && !callId.startsWith('call_')) {
+        if (callId && !String(callId).startsWith('call_')) {
             callLogUpdateFilter = { call_id: callId };
         } else {
             const latestByContact = await db.collection('CallLogs').findOne(
@@ -499,7 +639,24 @@ export class CallWorker {
             if (latestByContact) callLogUpdateFilter = { _id: latestByContact._id };
         }
 
-        console.log(`💰 [Worker] Processing credit deduction for Call ID: ${callId} (Duration: ${duration}s)...`);
+        console.log(
+            `💰 [Worker] Processing credit deduction for Call ID: ${callId} (Duration: ${duration}s, billing attempts: ${billingAttemptsUsed}/${CALL_CREDIT_MAX_ATTEMPTS})...`
+        );
+
+        // Idempotency: BullMQ retries must not double-deduct for the same call_id
+        if (callId && !String(callId).startsWith('call_')) {
+            const alreadyBilled = await db.collection('credittransactions').findOne({
+                type: 'call_deduction',
+                $or: [
+                    { 'reference.callId': callId },
+                    { 'reference.callId': String(callId) }
+                ]
+            });
+            if (alreadyBilled) {
+                console.log(`ℹ️ [Worker] Credit already recorded for call ${callId}, skipping duplicate post-call billing.`);
+                return;
+            }
+        }
 
         try {
             // 1. Fetch Campaign and User
@@ -561,7 +718,6 @@ export class CallWorker {
             // 3. Billing Brackets and Cost Calculation
             const durationInSeconds = duration; // Already in seconds from logic above
 
-            console.log("duration seconds :::::::", durationInSeconds)
             const fullMinutes = Math.floor(durationInSeconds / 60);
             const remainingSeconds = durationInSeconds % 60;
 
@@ -672,23 +828,46 @@ export class CallWorker {
                 );
             }
 
-            console.log(`✅ [Worker] Post-call actions completed for ${callId}. Cost: ${cost}`);
+            console.log(
+                `✅ [Worker] Post-call actions completed for ${callId}. Cost: ${cost} (billing attempts used: ${billingAttemptsUsed}/${CALL_CREDIT_MAX_ATTEMPTS})`
+            );
 
-            // 8. Trigger Call Analysis API
-            if (callId && !callId.startsWith('call_')) {
+            // 8. Trigger Call Analysis API (retries: indexing often lags a few seconds after call end)
+            if (callId && !String(callId).startsWith('call_')) {
                 try {
-                    console.log(`🧠 [Worker] Triggering Analysis API for Call ID: ${callId}...`);
-                    const analysisUrl = `http://72.60.221.48:5000/analyze/call/${callId}`;
-                    const analysisResponse = await fetch(analysisUrl, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' }
-                    });
+                    // ANALYSIS_API_URL can be base (http://host:5000) or prefix (http://host:5000/analyze/call)
+                    const rawAnalysis = (config.analysis?.apiUrl || 'http://72.60.221.48:5000').replace(/\/$/, '');
+                    const analysisUrl = rawAnalysis.includes('/analyze/call')
+                        ? `${rawAnalysis}/${encodeURIComponent(String(callId))}`
+                        : `${rawAnalysis}/analyze/call/${encodeURIComponent(String(callId))}`;
 
-                    if (analysisResponse.ok) {
-                        console.log(`✅ [Worker] Analysis API triggered successfully for ${callId}`);
-                    } else {
+                    for (let attempt = 1; attempt <= ANALYSIS_API_MAX_ATTEMPTS; attempt++) {
+                        console.log(`🧠 [Worker] Triggering Analysis API for Call ID: ${callId} (attempt ${attempt}/${ANALYSIS_API_MAX_ATTEMPTS})...`);
+                        const analysisResponse = await fetch(analysisUrl, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' }
+                        });
+
+                        if (analysisResponse.ok) {
+                            console.log(`✅ [Worker] Analysis API triggered successfully for ${callId}`);
+                            break;
+                        }
+
                         const errText = await analysisResponse.text();
+                        const notReady =
+                            analysisResponse.status === 404 ||
+                            analysisResponse.status === 503 ||
+                            analysisResponse.status === 502 ||
+                            /not\s*found/i.test(errText);
+
+                        if (notReady && attempt < ANALYSIS_API_MAX_ATTEMPTS) {
+                            console.warn(`⚠️ [Worker] Analysis API not ready for ${callId} (${analysisResponse.status}), retry in ${ANALYSIS_API_RETRY_MS}ms...`);
+                            await new Promise(r => setTimeout(r, ANALYSIS_API_RETRY_MS));
+                            continue;
+                        }
+
                         console.warn(`⚠️ [Worker] Analysis API failed for ${callId}:`, errText);
+                        break;
                     }
                 } catch (analysisError) {
                     console.error(`❌ [Worker] Error triggering Analysis API:`, analysisError.message);
