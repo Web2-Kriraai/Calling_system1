@@ -15,6 +15,7 @@ const POST_CALL_DELAY_MS = parseInt(process.env.POST_CALL_DELAY_MS || '2500', 10
 const POST_CALL_WORKER_CONCURRENCY = parseInt(process.env.POST_CALL_WORKER_CONCURRENCY || '500', 10);
 const ANALYSIS_API_MAX_ATTEMPTS = parseInt(process.env.ANALYSIS_API_MAX_ATTEMPTS || '5', 10);
 const ANALYSIS_API_RETRY_MS = parseInt(process.env.ANALYSIS_API_RETRY_MS || '3000', 10);
+const ANALYSIS_API_INITIAL_DELAY_MS = parseInt(process.env.ANALYSIS_API_INITIAL_DELAY_MS || '2500', 10);
 const CALL_CREDIT_MAX_ATTEMPTS = parseInt(process.env.CALL_CREDIT_MAX_ATTEMPTS || '5', 10);
 const CALL_CREDIT_RETRY_MS = parseInt(process.env.CALL_CREDIT_RETRY_MS || '3000', 10);
 
@@ -126,6 +127,61 @@ export class CallWorker {
             this.postCallWorker.close(),
             this.postCallQueue.close()
         ]);
+    }
+
+    /**
+     * Persist operational errors to MongoDB errorlogs collection.
+     * Uses native driver shape compatible with the provided ErrorLog mongoose schema.
+     */
+    async logErrorToDb({
+        errorType = 'system_error',
+        errorCategory = 'unknown',
+        severity = 'error',
+        errorMessage,
+        errorStack,
+        errorCode,
+        userId,
+        userEmail,
+        campaignId,
+        campaignName,
+        contactId,
+        callId,
+        metadata
+    }) {
+        try {
+            const db = await getDb();
+
+            const toObjectIdOrNull = (value) => {
+                try {
+                    return value ? new ObjectId(String(value)) : null;
+                } catch {
+                    return null;
+                }
+            };
+
+            const doc = {
+                timestamp: new Date(),
+                errorType,
+                errorCategory,
+                severity,
+                errorMessage: String(errorMessage || 'Unknown error'),
+                errorStack: errorStack ? String(errorStack) : undefined,
+                errorCode: errorCode ? String(errorCode) : undefined,
+                userId: userId ? String(userId) : undefined,
+                userEmail: userEmail ? String(userEmail) : undefined,
+                campaignId: toObjectIdOrNull(campaignId),
+                campaignName: campaignName ? String(campaignName) : undefined,
+                contactId: toObjectIdOrNull(contactId),
+                callId: callId ? String(callId) : undefined,
+                metadata,
+                resolved: false
+            };
+
+            await db.collection('errorlogs').insertOne(doc);
+        } catch (logErr) {
+            // Never throw from error logger; avoid cascading failures.
+            console.error('⚠️ [Worker] Failed to write errorlogs record:', logErr.message);
+        }
     }
 
     async processJob(job) {
@@ -395,6 +451,7 @@ export class CallWorker {
             // Fetch state for system-level error retry
             const db = await getDb();
             const contact = await db.collection('contactprocessings').findOne({ _id: contactObjId });
+            const campaignForError = await db.collection('campaigns').findOne({ _id: new ObjectId(campaignId) });
             const maxRetries = metadata.maxRetryAttempts || 3;
             const retryDelayMinutes = metadata.retryDelayMinutes || 30;
             const currentRetryCount = contact?.retryCount || 0;
@@ -426,6 +483,27 @@ export class CallWorker {
             );
 
             console.log(`✅ [Worker] Error handled for contact ${contactId}. Next status: ${status}.`);
+
+            await this.logErrorToDb({
+                errorType: 'call_failure',
+                errorCategory: 'worker_execution',
+                severity: 'error',
+                errorMessage: error.message,
+                errorStack: error.stack,
+                errorCode: String(error.message || '').includes('fetch failed') ? 'FETCH_FAILED' : undefined,
+                userId: userId,
+                userEmail: campaignForError?.createdBy,
+                campaignId,
+                campaignName: campaignForError?.campaignName || campaignForError?.name,
+                contactId,
+                metadata: {
+                    jobId: job.id,
+                    callReceiveStatus: contact?.callReceiveStatus,
+                    retryStatus: status,
+                    retryCountAfterUpdate: (contact?.retryCount || 0) + 1
+                }
+            });
+
             return { success: false, error: error.message };
         } finally {
             // 6. Release Concurrency Slot (Conditional - only if we had failed unexpectedly before status loop)
@@ -512,13 +590,12 @@ export class CallWorker {
         const apiResponse = result.apiResponse || {};
         const db = await getDb();
 
-        // Delay is applied when the post-call job is enqueued (BullMQ job.delay), not here — avoids blocking main workers
-
         // 1. Fetch Verified Duration from CallLogs
         let duration = 0;
-        let callId = apiResponse.call?.id || apiResponse.call_id || apiResponse.id || apiResponse.callId;
-        const apiCallId = (callId && !String(callId).startsWith('call_')) ? callId : null;
-
+        // Prefer deriving callId from CallLogs (matched by lead_id/contact), not from API response.
+        let callId = null;
+        let leadId = apiResponse.call?.lead_id || apiResponse.lead_id || null;
+        const apiCallId = null;
         let billingAttemptsUsed = 1;
 
         try {
@@ -543,7 +620,10 @@ export class CallWorker {
 
                     while (Date.now() - pollStart < maxPollTime) {
                         pollRound += 1;
-                        if (callId && !String(callId).startsWith('call_')) {
+                        if (leadId != null) {
+                            callLog = await db.collection('CallLogs').findOne({ lead_id: leadId });
+                        }
+                        if (!callLog && callId && !String(callId).startsWith('call_')) {
                             callLog = await db.collection('CallLogs').findOne({ call_id: callId });
                         }
 
@@ -570,7 +650,10 @@ export class CallWorker {
                         await new Promise(resolve => setTimeout(resolve, pollInterval));
                     }
                 } else {
-                    if (apiCallId != null) {
+                    if (leadId != null) {
+                        callLog = await db.collection('CallLogs').findOne({ lead_id: leadId });
+                    }
+                    if (!callLog && apiCallId != null) {
                         callLog = await db.collection('CallLogs').findOne({ call_id: apiCallId });
                     }
                     if (!callLog && callId && !String(callId).startsWith('call_')) {
@@ -590,9 +673,15 @@ export class CallWorker {
                 }
 
                 if (callLog) {
-                    const isCurrentCall = apiCallId == null || String(callLog.call_id) === String(apiCallId);
+                    const isCurrentCall =
+                        (leadId != null && String(callLog.lead_id) === String(leadId)) ||
+                        (apiCallId != null && String(callLog.call_id) === String(apiCallId)) ||
+                        (leadId == null && apiCallId == null);
                     if (isCurrentCall) {
-                        if (apiCallId == null) callId = callLog.call_id || callId;
+                        if (callLog.call_id) {
+                            callId = callLog.call_id;
+                        }
+                        if (leadId == null) leadId = callLog.lead_id || leadId;
                         const events = callLog.call_data?.events || [];
                         duration = computeDurationFromEvents(events);
                         if (duration > 0) {
@@ -614,7 +703,7 @@ export class CallWorker {
 
                 if (duration > 0) break;
                 if (creditAttempt >= CALL_CREDIT_MAX_ATTEMPTS) break;
-                if (!apiCallId) break;
+                if (!apiCallId && leadId == null) break;
             }
         } catch (logError) {
             console.error(`❌ [Worker] Error fetching CallLog:`, logError.message);
@@ -624,13 +713,29 @@ export class CallWorker {
         if (apiCallId != null) {
             callId = apiCallId;
         }
+        if (leadId == null && apiResponse.call?.lead_id != null) {
+            leadId = apiResponse.call.lead_id;
+        }
         // Fallback Call ID if still missing
         callId = callId || `call_${Date.now()}`;
 
-        // Resolve which CallLog doc to update: by call_id (current attempt) so we don't update an older attempt for same contact
+        // Resolve target CallLog document (prefer lead_id, then call_id, then latest by contact)
+        // NOTE: lead_id/call_id may be stored as string or number, so use type-safe $or filters.
         let callLogUpdateFilter = null;
-        if (callId && !String(callId).startsWith('call_')) {
-            callLogUpdateFilter = { call_id: callId };
+        if (leadId != null) {
+            callLogUpdateFilter = {
+                $or: [
+                    { lead_id: leadId },
+                    { lead_id: String(leadId) }
+                ]
+            };
+        } else if (callId && !String(callId).startsWith('call_')) {
+            callLogUpdateFilter = {
+                $or: [
+                    { call_id: callId },
+                    { call_id: String(callId) }
+                ]
+            };
         } else {
             const latestByContact = await db.collection('CallLogs').findOne(
                 { $or: [{ contact_id: contactId }, { contact_id: new ObjectId(contactId) }] },
@@ -640,20 +745,26 @@ export class CallWorker {
         }
 
         console.log(
-            `💰 [Worker] Processing credit deduction for Call ID: ${callId} (Duration: ${duration}s, billing attempts: ${billingAttemptsUsed}/${CALL_CREDIT_MAX_ATTEMPTS})...`
+            `💰 [Worker] Processing credit deduction for Call ID: ${callId}, Lead ID: ${leadId ?? 'N/A'} (Duration: ${duration}s, billing attempts: ${billingAttemptsUsed}/${CALL_CREDIT_MAX_ATTEMPTS})...`
         );
 
-        // Idempotency: BullMQ retries must not double-deduct for the same call_id
-        if (callId && !String(callId).startsWith('call_')) {
+        // Idempotency: BullMQ retries must not double-deduct for same lead_id/call_id
+        if (leadId != null || (callId && !String(callId).startsWith('call_'))) {
+            const dedupeOr = [];
+            if (leadId != null) {
+                dedupeOr.push({ 'reference.leadId': leadId });
+                dedupeOr.push({ 'reference.leadId': String(leadId) });
+            }
+            if (callId && !String(callId).startsWith('call_')) {
+                dedupeOr.push({ 'reference.callId': callId });
+                dedupeOr.push({ 'reference.callId': String(callId) });
+            }
             const alreadyBilled = await db.collection('credittransactions').findOne({
                 type: 'call_deduction',
-                $or: [
-                    { 'reference.callId': callId },
-                    { 'reference.callId': String(callId) }
-                ]
+                $or: dedupeOr
             });
             if (alreadyBilled) {
-                console.log(`ℹ️ [Worker] Credit already recorded for call ${callId}, skipping duplicate post-call billing.`);
+                console.log(`ℹ️ [Worker] Credit already recorded for call ${callId} / lead ${leadId ?? 'N/A'}, skipping duplicate post-call billing.`);
                 return;
             }
         }
@@ -747,7 +858,7 @@ export class CallWorker {
             if (user.credits < cost) {
                 console.warn(`⚠️ [Worker] Insufficient credits for ${user.email}. Cost: ${cost}, Balance: ${user.credits}`);
                 if (callLogUpdateFilter) {
-                    await db.collection('CallLogs').updateOne(
+                    const logUpdate = await db.collection('CallLogs').updateOne(
                         callLogUpdateFilter,
                         {
                             $set: {
@@ -758,6 +869,9 @@ export class CallWorker {
                             }
                         }
                     );
+                    if (logUpdate.matchedCount === 0) {
+                        console.warn(`⚠️ [Worker] No CallLog matched while marking insufficient_credits (callId=${callId}, leadId=${leadId ?? 'N/A'})`);
+                    }
                 }
                 return;
             }
@@ -786,7 +900,8 @@ export class CallWorker {
                     campaignId: campaign._id,
                     campaignName: campaign.name || campaign.campaignName,
                     callDuration: durationInSeconds,
-                    callId: callId
+                    callId: callId,
+                    leadId: leadId
                 },
                 createdAt: new Date(),
                 updatedAt: new Date()
@@ -813,19 +928,19 @@ export class CallWorker {
 
             // 7. Update Call Log (by call_id so we update the current attempt, not a previous one for same contact)
             if (callLogUpdateFilter) {
-                await db.collection('CallLogs').updateOne(
+                const logUpdate = await db.collection('CallLogs').updateOne(
                     callLogUpdateFilter,
                     {
                         $set: {
                             creditsDeducted: true,
                             creditsDeductedAmount: cost,
-                            duration: durationInSeconds,
-                            call_id: callId,
-                            processedAt: new Date(),
                             updatedAt: new Date()
                         }
                     }
                 );
+                if (logUpdate.matchedCount === 0) {
+                    console.warn(`⚠️ [Worker] No CallLog matched for creditsDeducted update (callId=${callId}, leadId=${leadId ?? 'N/A'})`);
+                }
             }
 
             console.log(
@@ -835,6 +950,11 @@ export class CallWorker {
             // 8. Trigger Call Analysis API (retries: indexing often lags a few seconds after call end)
             if (callId && !String(callId).startsWith('call_')) {
                 try {
+                    // Give transcript/turns pipeline a brief head start before first analysis request.
+                    if (ANALYSIS_API_INITIAL_DELAY_MS > 0) {
+                        await new Promise(r => setTimeout(r, ANALYSIS_API_INITIAL_DELAY_MS));
+                    }
+
                     // ANALYSIS_API_URL can be base (http://host:5000) or prefix (http://host:5000/analyze/call)
                     const rawAnalysis = (config.analysis?.apiUrl || 'http://72.60.221.48:5000').replace(/\/$/, '');
                     const analysisUrl = rawAnalysis.includes('/analyze/call')
@@ -876,6 +996,17 @@ export class CallWorker {
 
         } catch (error) {
             console.error(`❌ [Worker] triggerPostCallActions CRITICAL ERROR:`, error.message);
+            await this.logErrorToDb({
+                errorType: 'system_error',
+                errorCategory: 'post_call_actions',
+                severity: 'critical',
+                errorMessage: error.message,
+                errorStack: error.stack,
+                campaignId,
+                contactId,
+                callId,
+                metadata: { stage: 'triggerPostCallActions' }
+            });
         }
     }
 }
