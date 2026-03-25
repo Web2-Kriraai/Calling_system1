@@ -10,6 +10,7 @@ import {
     config
 } from 'shared-lib';
 import { ObjectId } from 'mongodb';
+import { DateTime } from 'luxon';
 
 const POST_CALL_DELAY_MS = parseInt(process.env.POST_CALL_DELAY_MS || '2500', 10);
 const POST_CALL_WORKER_CONCURRENCY = parseInt(process.env.POST_CALL_WORKER_CONCURRENCY || '500', 10);
@@ -42,6 +43,83 @@ function computeDurationFromEvents(events) {
         if (!Number.isNaN(d) && d >= 0) return d;
     }
     return 0;
+}
+
+function resolveCampaignZone(timezoneStr) {
+    const tz = timezoneStr || 'Asia/Kolkata';
+    if (typeof tz !== 'string') return 'Asia/Kolkata';
+    if (tz.includes('Chennai') || tz.includes('Kolkata') || tz.includes('Mumbai')) return 'Asia/Kolkata';
+    const match = tz.match(/UTC([+-]\d+:\d+)/);
+    if (match) return `UTC${match[1]}`;
+    // If it's a valid IANA zone, Luxon will accept it; otherwise it will fall back to local.
+    return tz;
+}
+
+function parseEndDateISO(endDate) {
+    if (!endDate) return null;
+    if (endDate instanceof Date) return DateTime.fromJSDate(endDate).toISODate();
+    if (typeof endDate === 'string') {
+        // Supports "YYYY-MM-DD" or ISO like "2026-03-28T00:00:00.000Z"
+        const m = endDate.match(/^(\d{4}-\d{2}-\d{2})/);
+        return m ? m[1] : null;
+    }
+    return null;
+}
+
+function parseEndTimeParts(endTime) {
+    if (!endTime || typeof endTime !== 'string') return null;
+    const t = endTime.trim();
+    const formats = ['HH:mm:ss', 'HH:mm', 'h:mm a', 'h:mm:ss a'];
+    for (const fmt of formats) {
+        const dt = DateTime.fromFormat(t, fmt, { zone: 'UTC' });
+        if (dt.isValid) return { hour: dt.hour, minute: dt.minute, second: dt.second };
+    }
+    return null;
+}
+
+function getCampaignEndDateTime(campaign) {
+    if (!campaign) return null;
+    const zone = resolveCampaignZone(campaign.timezone);
+    const endDateISO = parseEndDateISO(campaign.endDate);
+    if (!endDateISO) return null;
+
+    const timeParts = parseEndTimeParts(campaign.endTime);
+    if (!timeParts) {
+        // If endTime isn't provided/parseable, treat it as end-of-day to avoid stopping early.
+        return DateTime.fromISO(endDateISO, { zone }).endOf('day');
+    }
+
+    const dt = DateTime.fromISO(endDateISO, { zone }).set({
+        hour: timeParts.hour,
+        minute: timeParts.minute,
+        second: timeParts.second,
+        millisecond: 0
+    });
+    return dt.isValid ? dt : null;
+}
+
+function isPastCampaignEnd(campaign) {
+    if (!campaign) return false;
+    if (campaign.tillCallsComplete === true) return false;
+    const endDt = getCampaignEndDateTime(campaign);
+    if (!endDt) return false;
+    const now = DateTime.now().setZone(endDt.zoneName);
+    return now > endDt;
+}
+
+async function shouldIgnoreEndWindow({ campaign, metadata, db }) {
+    if (metadata?.ignoreEndWindow === true) return true;
+    // Fallback for already-enqueued jobs that don't have metadata.ignoreEndWindow yet:
+    // Only do a DB lookup when the campaign has a googleSheetsDataId.
+    if (!campaign?.googleSheetsDataId) return false;
+    try {
+        const sheetDoc = await db.collection('googlesheetsdatas').findOne({
+            _id: new ObjectId(campaign.googleSheetsDataId)
+        });
+        return sheetDoc?.autoSyncEnabled === true;
+    } catch {
+        return false;
+    }
 }
 
 export class CallWorker {
@@ -207,6 +285,14 @@ export class CallWorker {
             return;
         }
 
+        // 0.05 End window guard: if endDate/endTime is passed and tillCallsComplete !== true, do not place calls
+        const ignoreEndWindow = await shouldIgnoreEndWindow({ campaign, metadata, db });
+        if (!ignoreEndWindow && isPastCampaignEnd(campaign)) {
+            const endDt = getCampaignEndDateTime(campaign);
+            console.log(`⏹️ [Worker] Job ${job.id} ignored: Campaign ${campaignId} is past end window (${endDt?.toISO?.() || 'unknown'}).`);
+            return;
+        }
+
         // 0.1 Fetch latest contact data and sync with BullMQ job data
         const contact = await db.collection('contactprocessings').findOne({ _id: contactObjId });
 
@@ -251,6 +337,11 @@ export class CallWorker {
                 const currentCampaign = await db.collection('campaigns').findOne({ _id: new ObjectId(campaignId) });
                 if (!currentCampaign || currentCampaign.status !== 'active' || currentCampaign.archive === true) {
                     console.log(`📡 [Worker] Job ${job.id} stopped waiting: Campaign no longer active.`);
+                    return;
+                }
+                if (!ignoreEndWindow && isPastCampaignEnd(currentCampaign)) {
+                    const endDt = getCampaignEndDateTime(currentCampaign);
+                    console.log(`⏹️ [Worker] Job ${job.id} stopped waiting: Campaign past end window (${endDt?.toISO?.() || 'unknown'}).`);
                     return;
                 }
 
@@ -312,6 +403,11 @@ export class CallWorker {
                             const currentCampaign = await db.collection('campaigns').findOne({ _id: new ObjectId(campaignId) });
                             if (!currentCampaign || currentCampaign.status !== 'active' || currentCampaign.archive === true) {
                                 console.log(`📡 [Worker] Campaign stopped. Dropping contact ${contactId}.`);
+                                return;
+                            }
+                            if (!ignoreEndWindow && isPastCampaignEnd(currentCampaign)) {
+                                const endDt = getCampaignEndDateTime(currentCampaign);
+                                console.log(`⏹️ [Worker] Campaign past end window. Dropping contact ${contactId} (end=${endDt?.toISO?.() || 'unknown'}).`);
                                 return;
                             }
 

@@ -1,5 +1,6 @@
 import { getDb, createQueue, calculatePriority, isWithinBusinessHours, parseISTTimeToDate } from 'shared-lib';
 import { ObjectId } from 'mongodb';
+import { DateTime } from 'luxon';
 
 export class Scheduler {
     constructor() {
@@ -241,6 +242,73 @@ export class Scheduler {
      * Processes a single campaign by scanning pending contacts.
      */
     async processCampaign(campaign, db) {
+        // If campaign uses Google Sheet with auto-sync enabled, we ignore endDate/endTime for dialing.
+        // We fetch the sheet doc once here and reuse it for both the end-window guard and completion logic.
+        let sheetDoc = null;
+        let ignoreEndWindow = false;
+        if (campaign?.googleSheetsDataId) {
+            try {
+                sheetDoc = await db.collection('googlesheetsdatas').findOne({
+                    _id: new ObjectId(campaign.googleSheetsDataId)
+                });
+                ignoreEndWindow = sheetDoc?.autoSyncEnabled === true;
+            } catch (err) {
+                console.warn(`[Scheduler] Could not fetch GoogleSheetsData for campaign ${campaign._id}:`, err.message);
+            }
+        }
+
+        // End window guard: if endDate/endTime is passed and tillCallsComplete !== true, do not enqueue new calls.
+        // (Worker also enforces this as a hard safety net for already-enqueued jobs)
+        try {
+            if (!ignoreEndWindow && campaign?.tillCallsComplete !== true && campaign?.endDate) {
+                const tz = campaign.timezone || 'Asia/Kolkata';
+                let zone = 'Asia/Kolkata';
+                if (typeof tz === 'string') {
+                    if (tz.includes('Chennai') || tz.includes('Kolkata') || tz.includes('Mumbai')) {
+                        zone = 'Asia/Kolkata';
+                    } else {
+                        const match = tz.match(/UTC([+-]\d+:\d+)/);
+                        zone = match ? `UTC${match[1]}` : tz;
+                    }
+                }
+
+                const endDateISO = (campaign.endDate instanceof Date)
+                    ? DateTime.fromJSDate(campaign.endDate).toISODate()
+                    : (typeof campaign.endDate === 'string' ? (campaign.endDate.match(/^(\d{4}-\d{2}-\d{2})/)?.[1] || null) : null);
+
+                if (endDateISO) {
+                    // Default to end-of-day if endTime is missing/unparseable.
+                    let endDt = DateTime.fromISO(endDateISO, { zone }).endOf('day');
+
+                    if (typeof campaign.endTime === 'string' && campaign.endTime.trim()) {
+                        const t = campaign.endTime.trim();
+                        const formats = ['HH:mm:ss', 'HH:mm', 'h:mm a', 'h:mm:ss a'];
+                        for (const fmt of formats) {
+                            const parsed = DateTime.fromFormat(t, fmt, { zone: 'UTC' });
+                            if (parsed.isValid) {
+                                endDt = DateTime.fromISO(endDateISO, { zone }).set({
+                                    hour: parsed.hour,
+                                    minute: parsed.minute,
+                                    second: parsed.second,
+                                    millisecond: 0
+                                });
+                                break;
+                            }
+                        }
+                    }
+
+                    const now = DateTime.now().setZone(endDt.zoneName);
+                    if (endDt.isValid && now > endDt) {
+                        console.log(`⏹️ [Scheduler] Campaign ${campaign.campaignName} (${campaign._id}) is past end window (${endDt.toISO()}). Skipping enqueue.`);
+                        return;
+                    }
+                }
+            }
+        } catch (e) {
+            // Never block scheduler loop because of end-window parsing issues
+            console.warn(`⚠️ [Scheduler] End window check failed for campaign ${campaign?._id}:`, e.message);
+        }
+
         if (!isWithinBusinessHours(campaign)) {
             // console.log(`🕒 [Scheduler] Campaign ${campaign.campaignName} (${campaign._id}) is currently outside calling hours. Skipping.`);
             return;
@@ -312,7 +380,8 @@ export class Scheduler {
                         userLimit: userConcurrentLimit, // ← user's actual purchased limit (cross-campaign total)
                         maxRetryAttempts: campaign.maxRetryAttempts || 3,
                         retryDelayMinutes: campaign.retryDelayMinutes || 30,
-                        voiceTier: campaign.selectedVoice?.tier || 'premium'
+                        voiceTier: campaign.selectedVoice?.tier || 'premium',
+                        ignoreEndWindow
                     }
                 },
                 opts: {
@@ -343,9 +412,12 @@ export class Scheduler {
             let canComplete = true;
             if (campaign.googleSheetsDataId) {
                 try {
-                    const sheetDoc = await db.collection('googlesheetsdatas').findOne({
-                        _id: new ObjectId(campaign.googleSheetsDataId)
-                    });
+                    // sheetDoc may have been fetched earlier; if not, fetch here.
+                    if (!sheetDoc) {
+                        sheetDoc = await db.collection('googlesheetsdatas').findOne({
+                            _id: new ObjectId(campaign.googleSheetsDataId)
+                        });
+                    }
                     if (sheetDoc?.autoSyncEnabled === true && sheetDoc?.autoSyncUntilDate) {
                         const until = new Date(sheetDoc.autoSyncUntilDate);
                         if (Date.now() < until.getTime()) {
