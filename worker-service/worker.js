@@ -4,6 +4,7 @@ import {
     getDb,
     concurrencyGuard,
     isWithinBusinessHours,
+    isCampaignBlockedByTestCall,
     queueName,
     postCallQueueName,
     createPostCallQueue,
@@ -274,11 +275,19 @@ export class CallWorker {
         // 0. Fetch latest campaign data to check status (Ensures we respect Paused/Stopped campaigns immediately)
         const campaign = await db.collection('campaigns').findOne({ _id: new ObjectId(campaignId) });
 
-        if (!campaign || campaign.status !== 'active' || campaign.archive === true) {
-            const reason = !campaign ? 'Campaign not found' :
-                campaign.archive === true ? 'Campaign is archived' :
-                    `Campaign status is ${campaign.status}`;
+        if (!campaign || campaign.archive === true) {
+            const reason = !campaign ? 'Campaign not found' : 'Campaign is archived';
+            console.log(`⏸️ [Worker] Job ${job.id} for campaign ${campaignId} ignored: ${reason}.`);
+            return;
+        }
 
+        if (isCampaignBlockedByTestCall(campaign)) {
+            console.log(`🧪 [Worker] Job ${job.id} for campaign ${campaignId} ignored: Campaign is testing (set testCallStatus to 'passed' after successful test call).`);
+            return;
+        }
+
+        if (campaign.status !== 'active') {
+            const reason = `Campaign status is ${campaign.status}`;
             console.log(`⏸️ [Worker] Job ${job.id} for campaign ${campaignId} ignored: ${reason}.`);
             // Just return. The job is marked as "completed" in BullMQ, but since we didn't update MongoDB status, 
             // the Scheduler will pick up this contact again in the next loop when the campaign becomes active and not archived.

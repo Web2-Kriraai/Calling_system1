@@ -212,6 +212,16 @@ export function calculatePriority(campaign, contact) {
 
     return Math.max(1, priority);
 }
+
+/**
+ * While campaign.status is `testing`, production activation is blocked until testCallStatus === 'passed'
+ * (set by your test-call completion handler).
+ */
+export function isCampaignBlockedByTestCall(campaign) {
+    if (!campaign || campaign.status !== 'testing') return false;
+    return campaign.testCallStatus !== 'passed';
+}
+
 /**
  * Parses a string time from IST into a UTC Date object.
  * Handles formats like "2026-03-12 10:00 AM", "10:00 AM" (assumes today), or ISO strings.

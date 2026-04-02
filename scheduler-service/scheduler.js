@@ -556,7 +556,7 @@
 //     }
 // }
 
-import { getDb, createQueue, calculatePriority, isWithinBusinessHours, parseISTTimeToDate } from 'shared-lib';
+import { getDb, createQueue, calculatePriority, isWithinBusinessHours, parseISTTimeToDate, isCampaignBlockedByTestCall } from 'shared-lib';
 import { ObjectId } from 'mongodb';
 import { DateTime } from 'luxon';
 
@@ -666,6 +666,11 @@ export class Scheduler {
                 continue;
             }
 
+            if (isCampaignBlockedByTestCall(campaign)) {
+                console.log(`🧪 [Scheduler] immediateStart campaign ${campaign.campaignName} (${campaignId}) is testing; waiting for testCallStatus=passed.`);
+                continue;
+            }
+
             // Activate!
             await db.collection('campaigns').updateOne(
                 { _id: campaignId },
@@ -695,7 +700,7 @@ export class Scheduler {
 
         // Find campaigns that are scheduled or active (to verify if they should still be active)
         const candidates = await db.collection('campaigns').find({
-            status: { $in: ['active', 'scheduled', 'processing', 'draft', 'error', 'pending'] },
+            status: { $in: ['active', 'scheduled', 'processing', 'draft', 'error', 'pending', 'testing'] },
             archive: { $ne: true }
         }).toArray();
 
@@ -733,6 +738,11 @@ export class Scheduler {
                         }
                     }
                 );
+                continue;
+            }
+
+            if (isCampaignBlockedByTestCall(campaign)) {
+                console.log(`🧪 [Scheduler] Campaign ${campaign.campaignName} (${campaignId}) is testing; waiting for testCallStatus=passed.`);
                 continue;
             }
 
@@ -1167,6 +1177,16 @@ export class Scheduler {
                         updateOne: {
                             filter: { _id: analysis._id },
                             update: { $set: { followUpProcessed: true, followUpError: !campaign ? 'campaign_not_found' : 'followup_disabled', updatedAt: new Date() } }
+                        }
+                    });
+                    continue;
+                }
+
+                if (isCampaignBlockedByTestCall(campaign)) {
+                    analysisFinalUpdates.push({
+                        updateOne: {
+                            filter: { _id: analysis._id },
+                            update: { $set: { followUpProcessed: true, followUpError: 'campaign_testing', updatedAt: new Date() } }
                         }
                     });
                     continue;
