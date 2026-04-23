@@ -989,11 +989,12 @@ export class Scheduler {
             status: { $nin: ['completed', 'failed'] }
         });
 
-        // PRODUCTION GUARD: Check if there are any AI analyses for this campaign still being processed.
-        // We must not complete the campaign if a follow-up is about to be scheduled.
+        // PRODUCTION GUARD: Only block completion for analyses that can schedule follow-ups.
+        // Non-call next actions (e.g. "None") are intentionally excluded so campaigns can finish.
         const pendingAnalyses = await db.collection('call_analysis').countDocuments({
             campaign_id: campaign._id.toString(),
-            followUpProcessed: { $ne: true }
+            followUpProcessed: { $ne: true },
+            'analysis_data.Next_Action.Type': { $regex: /^call$/i }
         });
 
         if (pendingCount === 0 && pendingAnalyses === 0) {

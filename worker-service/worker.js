@@ -430,10 +430,18 @@ export class CallWorker {
 
         try {
             // 3. Update Status to 'processing'
-            await db.collection('contactprocessings').updateOne(
-                { _id: contactObjId },
-                { $set: { status: 'processing', lastAttemptAt: new Date() } }
+            const processingTransition = await db.collection('contactprocessings').updateOne(
+                { _id: contactObjId, status: { $nin: ['completed', 'failed'] } },
+                { $set: { status: 'processing', lastAttemptAt: new Date(), updatedAt: new Date() } }
             );
+
+            if (processingTransition.matchedCount === 0) {
+                const alreadyHandledContact = await db.collection('contactprocessings').findOne({ _id: contactObjId });
+                console.log(
+                    `⏩ [Worker] Skipping contact ${contactId}: already in terminal state (${alreadyHandledContact?.status || 'unknown'}).`
+                );
+                return;
+            }
 
             // 4. Fetch latest contact data again to ensure consistent retry logic after slot acquisition
             const currentContact = await db.collection('contactprocessings').findOne({ _id: contactObjId });
@@ -525,12 +533,27 @@ export class CallWorker {
                 dbStatus: updatedContact?.status
             });
 
+            // Re-read the latest DB state before final decision to avoid stale/local poll values
+            // marking contacts as completed when webhook updates are still in-flight.
+            const latestContactForDecision = await db.collection('contactprocessings').findOne({ _id: contactObjId });
+            const persistedFinalStatus = parseInt(latestContactForDecision?.callReceiveStatus);
+            if (Number.isFinite(persistedFinalStatus) && callStatus === 3 && persistedFinalStatus !== 3) {
+                console.warn(
+                    `⚠️ [Worker] Contact ${contactId} had transient COMPLETED state, but latest DB status is ${persistedFinalStatus}. Falling back to latest status for retry/follow-up decision.`
+                );
+                callStatus = persistedFinalStatus;
+            }
+
             console.log(`🔍 [Worker] Final Status for ${contactId}: DB=${callStatus}`);
 
-            const maxRetries = metadata.maxRetryAttempts || 3;
+            const configuredMaxRetries = Number(metadata.maxRetryAttempts);
+            const maxRetries = Number.isFinite(configuredMaxRetries)
+                ? Math.max(0, configuredMaxRetries)
+                : 3;
             const retryDelayMinutes = metadata.retryDelayMinutes || 30;
-            const currentRetryCount = currentContact.retryCount || 0;
-            const currentAttempts = (currentContact.callAttempts?.length || 0) + 1;
+            const decisionContact = latestContactForDecision || currentContact;
+            const currentRetryCount = decisionContact.retryCount || 0;
+            const currentAttempts = (decisionContact.callAttempts?.length || 0) + 1;
 
             if (callStatus === 3) {
                 // COMPLETED: Success, release slot.
@@ -542,7 +565,7 @@ export class CallWorker {
                     {
                         $set: {
                             status: 'completed',
-                            callReceiveStatus: callStatus,
+                            callReceiveStatus: 3,
                             updatedAt: new Date()
                         },
                         $push: {
@@ -577,32 +600,106 @@ export class CallWorker {
                 }
             } else {
                 // FAILED (0) or NOT RECEIVED (1): Persist immediately; nextRetryAt from attempt start so delay is not inflated by polling
-                const isRetryable = currentRetryCount + 1 < maxRetries;
-                const nextStatus = isRetryable ? 'retry' : 'failed';
+                // retryCount tracks failed attempts already consumed; allow retries until it reaches maxRetries
+                const isRetryable = currentRetryCount < maxRetries;
                 const baseTime = attemptStartedAt > 0 ? attemptStartedAt : Date.now();
+                const shouldScheduleFallbackFollowUp =
+                    !isRetryable &&
+                    callStatus === 1 &&
+                    campaign?.followup === true &&
+                    !decisionContact?.isFollowUp;
+                const nextStatus = shouldScheduleFallbackFollowUp
+                    ? 'pending'
+                    : (isRetryable ? 'retry' : 'failed');
                 const nextRetryAt = isRetryable ? new Date(baseTime + retryDelayMinutes * 60000) : null;
+                const followUpScheduledAt = shouldScheduleFallbackFollowUp
+                    ? new Date(baseTime + retryDelayMinutes * 60000)
+                    : null;
                 const attemptTimestamp = new Date(attemptStartedAt > 0 ? attemptStartedAt : Date.now());
 
-                await db.collection('contactprocessings').updateOne(
-                    { _id: contactObjId },
-                    {
-                        $set: {
-                            status: nextStatus,
-                            callReceiveStatus: callStatus,
-                            nextRetryAt,
-                            updatedAt: new Date()
-                        },
-                        $inc: { retryCount: 1 },
-                        $push: {
-                            callAttempts: {
-                                attempt: currentAttempts,
-                                timestamp: attemptTimestamp,
-                                status: nextStatus,
-                                message: callStatus === 1 ? 'Not Received' : 'API Attempt Failed'
-                            }
+                const updateDoc = {
+                    $set: {
+                        status: nextStatus,
+                        callReceiveStatus: callStatus,
+                        nextRetryAt,
+                        updatedAt: new Date()
+                    },
+                    $push: {
+                        callAttempts: {
+                            attempt: currentAttempts,
+                            timestamp: attemptTimestamp,
+                            status: shouldScheduleFallbackFollowUp ? 'follow-up' : nextStatus,
+                            message: shouldScheduleFallbackFollowUp
+                                ? 'Not Received - Scheduled Follow-up'
+                                : (callStatus === 1 ? 'Not Received' : 'API Attempt Failed')
                         }
                     }
+                };
+
+                if (shouldScheduleFallbackFollowUp) {
+                    updateDoc.$set.scheduledAt = followUpScheduledAt;
+                    updateDoc.$set.isFollowUp = true;
+                    updateDoc.$set.lastFollowUpAt = new Date();
+                    updateDoc.$set.retryCount = 0;
+                } else {
+                    updateDoc.$inc = { retryCount: 1 };
+                }
+
+                const retryWriteResult = await db.collection('contactprocessings').updateOne(
+                    { _id: contactObjId, callReceiveStatus: { $ne: 3 } },
+                    updateDoc
                 );
+
+                if (retryWriteResult.matchedCount === 0) {
+                    // Another webhook/update marked this contact as completed while we were deciding.
+                    const lateFinalContact = await db.collection('contactprocessings').findOne({ _id: contactObjId });
+                    const lateStatus = parseInt(lateFinalContact?.callReceiveStatus) || 0;
+
+                    if (lateStatus === 3) {
+                        console.log(`✅ [Worker] Contact ${contactId} completed during retry write. Finalizing as completed.`);
+
+                        await db.collection('contactprocessings').updateOne(
+                            { _id: contactObjId },
+                            {
+                                $set: {
+                                    status: 'completed',
+                                    callReceiveStatus: 3,
+                                    updatedAt: new Date()
+                                },
+                                $push: {
+                                    callAttempts: {
+                                        attempt: currentAttempts,
+                                        timestamp: new Date(),
+                                        status: 'completed',
+                                        message: 'Success (late confirmation)'
+                                    }
+                                }
+                            }
+                        );
+
+                        if (currentlyHoldingSlot) {
+                            await concurrencyGuard.releaseSlot(campaignId, userId);
+                            currentlyHoldingSlot = false;
+                        }
+                        shouldReleaseSlot = false;
+
+                        try {
+                            await this.enqueuePostCallJob(job.data, result);
+                        } catch (triggerError) {
+                            console.error(`⚠️ [Worker] Post-call enqueue failed after late completion, running inline:`, triggerError.message);
+                            try {
+                                await new Promise(r => setTimeout(r, POST_CALL_DELAY_MS));
+                                await this.triggerPostCallActions(job.data, result, metadata, lateFinalContact || decisionContact);
+                            } catch (inlineErr) {
+                                console.error(`⚠️ [Worker] Inline post-call failed after late completion:`, inlineErr.message);
+                            }
+                        }
+
+                        return result;
+                    }
+
+                    console.warn(`⚠️ [Worker] Retry/fail write skipped for ${contactId}; latest status=${lateFinalContact?.status}, callReceiveStatus=${lateStatus}.`);
+                }
 
                 // RELEASE SLOT if holding
                 if (currentlyHoldingSlot) {
@@ -611,7 +708,11 @@ export class CallWorker {
                 }
                 shouldReleaseSlot = false;
 
-                console.log(`🔁 [Worker] Call ${contactId} FAILED/RETRY (Status: ${callStatus}). Releasing slot.`);
+                if (shouldScheduleFallbackFollowUp) {
+                    console.log(`🔄 [Worker] Call ${contactId} remained NOT RECEIVED after retries. Scheduled one follow-up at ${followUpScheduledAt?.toISOString?.()}.`);
+                } else {
+                    console.log(`🔁 [Worker] Call ${contactId} FAILED/RETRY (Status: ${callStatus}). Releasing slot.`);
+                }
             }
 
             return result;
@@ -622,12 +723,15 @@ export class CallWorker {
             const db = await getDb();
             const contact = await db.collection('contactprocessings').findOne({ _id: contactObjId });
             const campaignForError = await db.collection('campaigns').findOne({ _id: new ObjectId(campaignId) });
-            const maxRetries = metadata.maxRetryAttempts || 3;
+            const configuredMaxRetries = Number(metadata.maxRetryAttempts);
+            const maxRetries = Number.isFinite(configuredMaxRetries)
+                ? Math.max(0, configuredMaxRetries)
+                : 3;
             const retryDelayMinutes = metadata.retryDelayMinutes || 30;
             const currentRetryCount = contact?.retryCount || 0;
             const currentAttempts = (contact?.callAttempts?.length || 0) + 1;
 
-            const isRetryable = currentRetryCount + 1 < maxRetries;
+            const isRetryable = currentRetryCount < maxRetries;
             const status = isRetryable ? 'retry' : 'failed';
             const nextRetryAt = isRetryable ? new Date(Date.now() + retryDelayMinutes * 60000) : null;
 
