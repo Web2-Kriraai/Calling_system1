@@ -20,6 +20,7 @@ const ANALYSIS_API_RETRY_MS = parseInt(process.env.ANALYSIS_API_RETRY_MS || '300
 const ANALYSIS_API_INITIAL_DELAY_MS = parseInt(process.env.ANALYSIS_API_INITIAL_DELAY_MS || '2500', 10);
 const CALL_CREDIT_MAX_ATTEMPTS = parseInt(process.env.CALL_CREDIT_MAX_ATTEMPTS || '5', 10);
 const CALL_CREDIT_RETRY_MS = parseInt(process.env.CALL_CREDIT_RETRY_MS || '3000', 10);
+const CALL_COMPLETION_CONFIRM_MS = parseInt(process.env.CALL_COMPLETION_CONFIRM_MS || '6000', 10);
 
 /**
  * Billable duration (seconds) from CallLog events. Prefers call_answered + call_hangup timestamps, then cdr_push.Duration when ANSWER.
@@ -554,6 +555,25 @@ export class CallWorker {
             const decisionContact = latestContactForDecision || currentContact;
             const currentRetryCount = decisionContact.retryCount || 0;
             const currentAttempts = (decisionContact.callAttempts?.length || 0) + 1;
+
+            // Avoid transient false-complete races:
+            // wait briefly and reconfirm status=3 before terminal "completed" write.
+            if (callStatus === 3 && CALL_COMPLETION_CONFIRM_MS > 0) {
+                await new Promise(resolve => setTimeout(resolve, CALL_COMPLETION_CONFIRM_MS));
+                const confirmedContact = await db.collection('contactprocessings').findOne({ _id: contactObjId });
+                const confirmedStatus = parseInt(confirmedContact?.callReceiveStatus) || 0;
+                if (confirmedStatus !== 3) {
+                    console.warn(
+                        `⚠️ [Worker] Completion check for ${contactId} flipped from 3 to ${confirmedStatus} after ${CALL_COMPLETION_CONFIRM_MS}ms; continuing with retry/fail path.`
+                    );
+                    callStatus = confirmedStatus;
+                    await job.updateData({
+                        ...job.data,
+                        callReceiveStatus: confirmedStatus,
+                        dbStatus: confirmedContact?.status
+                    });
+                }
+            }
 
             if (callStatus === 3) {
                 // COMPLETED: Success, release slot.
