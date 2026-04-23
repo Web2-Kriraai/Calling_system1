@@ -666,7 +666,11 @@ export class CallWorker {
                 }
 
                 const retryWriteResult = await db.collection('contactprocessings').updateOne(
-                    { _id: contactObjId, callReceiveStatus: { $ne: 3 } },
+                    {
+                        _id: contactObjId,
+                        callReceiveStatus: { $ne: 3 },
+                        status: 'processing',
+                    },
                     updateDoc
                 );
 

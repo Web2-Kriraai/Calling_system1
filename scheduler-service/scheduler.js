@@ -1164,13 +1164,33 @@ export class Scheduler {
                 _id: { $in: campaignIds.map(id => (typeof id === 'string' ? new ObjectId(id) : id)) }
             }).toArray();
             const campaignMap = new Map(campaigns.map(c => [c._id.toString(), c]));
+            const contactIdToObjectId = (value) => {
+                try {
+                    return typeof value === 'string' ? new ObjectId(value) : value;
+                } catch {
+                    return null;
+                }
+            };
+            const contactObjectIds = analyses
+                .map(a => contactIdToObjectId(a.contact_id))
+                .filter(Boolean);
+            const contacts = contactObjectIds.length > 0
+                ? await db.collection('contactprocessings').find(
+                    { _id: { $in: contactObjectIds } },
+                    { projection: { _id: 1, status: 1, callReceiveStatus: 1, nextRetryAt: 1, isFollowUp: 1 } }
+                ).toArray()
+                : [];
+            const contactMap = new Map(contacts.map(c => [String(c._id), c]));
 
             const contactBulkUpdates = [];
+            const contactPolicyAuditUpdates = [];
             const analysisFinalUpdates = [];
 
             for (const analysis of analyses) {
                 const { contact_id, campaign_id, analysis_data } = analysis;
                 const campaign = campaignMap.get(campaign_id?.toString());
+                const contactObjId = contactIdToObjectId(contact_id);
+                const contactSnapshot = contactObjId ? contactMap.get(String(contactObjId)) : null;
 
                 // Skip if campaign is missing or follow-up disabled
                 if (!campaign || campaign.followup !== true) {
@@ -1193,6 +1213,97 @@ export class Scheduler {
                     continue;
                 }
 
+                if (!contactObjId) {
+                    analysisFinalUpdates.push({
+                        updateOne: {
+                            filter: { _id: analysis._id },
+                            update: { $set: { followUpProcessed: true, followUpError: 'invalid_contact_id', updatedAt: new Date() } }
+                        }
+                    });
+                    continue;
+                }
+
+                if (!contactSnapshot) {
+                    analysisFinalUpdates.push({
+                        updateOne: {
+                            filter: { _id: analysis._id },
+                            update: { $set: { followUpProcessed: true, followUpError: 'contact_not_found', updatedAt: new Date() } }
+                        }
+                    });
+                    continue;
+                }
+
+                // retry_wins policy: follow-up scheduling only transitions a truly completed call.
+                // This prevents follow-up writes from overriding retry/processing states.
+                if (String(contactSnapshot.status) !== 'completed') {
+                    contactPolicyAuditUpdates.push({
+                        updateOne: {
+                            filter: { _id: contactObjId },
+                            update: {
+                                $push: {
+                                    statusHistory: {
+                                        fromStatus: String(contactSnapshot.status || ''),
+                                        toStatus: String(contactSnapshot.status || ''),
+                                        reason: 'follow-up-skipped-retry-wins',
+                                        policy: 'retry_wins',
+                                        analysisId: analysis._id,
+                                        note: 'Skipped follow-up because contact is not in completed state',
+                                        timestamp: new Date()
+                                    }
+                                }
+                            }
+                        }
+                    });
+                    analysisFinalUpdates.push({
+                        updateOne: {
+                            filter: { _id: analysis._id },
+                            update: {
+                                $set: {
+                                    followUpProcessed: true,
+                                    followUpError: 'retry_wins_state_not_completed',
+                                    followUpSkippedBecauseStatus: String(contactSnapshot.status || ''),
+                                    updatedAt: new Date()
+                                }
+                            }
+                        }
+                    });
+                    continue;
+                }
+                if (Number(contactSnapshot.callReceiveStatus) !== 3) {
+                    contactPolicyAuditUpdates.push({
+                        updateOne: {
+                            filter: { _id: contactObjId },
+                            update: {
+                                $push: {
+                                    statusHistory: {
+                                        fromStatus: String(contactSnapshot.status || ''),
+                                        toStatus: String(contactSnapshot.status || ''),
+                                        reason: 'follow-up-skipped-retry-wins',
+                                        policy: 'retry_wins',
+                                        analysisId: analysis._id,
+                                        note: `Skipped follow-up because callReceiveStatus=${Number(contactSnapshot.callReceiveStatus || 0)} (expected 3)`,
+                                        timestamp: new Date()
+                                    }
+                                }
+                            }
+                        }
+                    });
+                    analysisFinalUpdates.push({
+                        updateOne: {
+                            filter: { _id: analysis._id },
+                            update: {
+                                $set: {
+                                    followUpProcessed: true,
+                                    followUpError: 'retry_wins_call_not_completed',
+                                    followUpSkippedBecauseReceiveStatus: Number(contactSnapshot.callReceiveStatus || 0),
+                                    updatedAt: new Date()
+                                }
+                            }
+                        }
+                    });
+                    continue;
+                }
+
                 // Analyze timing
                 const nextAction = analysis_data?.Next_Action;
                 let scheduledTime = null;
@@ -1205,13 +1316,14 @@ export class Scheduler {
                 // Push Contact Update
                 contactBulkUpdates.push({
                     updateOne: {
-                        filter: { _id: (typeof contact_id === 'string' ? new ObjectId(contact_id) : contact_id) },
+                        filter: { _id: contactObjId, status: 'completed', callReceiveStatus: 3 },
                         update: {
                             $set: {
                                 status: 'pending',
                                 scheduledAt: scheduledTime,
                                 priority: nextAction?.Priority || 'Medium',
                                 callReceiveStatus: 0,
+                                nextRetryAt: null,
                                 retryCount: 0,
                                 isFollowUp: true,
                                 lastFollowUpAt: new Date(),
@@ -1261,6 +1373,9 @@ export class Scheduler {
             // 3. High-Speed Execution
             if (contactBulkUpdates.length > 0) {
                 await db.collection('contactprocessings').bulkWrite(contactBulkUpdates, { ordered: false });
+            }
+            if (contactPolicyAuditUpdates.length > 0) {
+                await db.collection('contactprocessings').bulkWrite(contactPolicyAuditUpdates, { ordered: false });
             }
             if (analysisFinalUpdates.length > 0) {
                 await db.collection('call_analysis').bulkWrite(analysisFinalUpdates, { ordered: false });
