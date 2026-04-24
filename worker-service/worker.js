@@ -24,6 +24,9 @@ const CALL_CREDIT_RETRY_MS = parseInt(process.env.CALL_CREDIT_RETRY_MS || '3000'
 const CALL_COMPLETION_CONFIRM_MS = parseInt(process.env.CALL_COMPLETION_CONFIRM_MS || '6000', 10);
 const BILLING_HEALTH_LOG_INTERVAL_MS = parseInt(process.env.BILLING_HEALTH_LOG_INTERVAL_MS || '300000', 10);
 const SLOT_HEARTBEAT_INTERVAL_MS = Math.max(2000, parseInt(process.env.SLOT_HEARTBEAT_INTERVAL_MS || '15000', 10));
+const MONGO_TX_MAX_ATTEMPTS = Math.max(1, parseInt(process.env.MONGO_TX_MAX_ATTEMPTS || '4', 10));
+const MONGO_TX_RETRY_BASE_MS = Math.max(10, parseInt(process.env.MONGO_TX_RETRY_BASE_MS || '75', 10));
+const MONGO_TX_RETRY_CAP_MS = Math.max(MONGO_TX_RETRY_BASE_MS, parseInt(process.env.MONGO_TX_RETRY_CAP_MS || '1200', 10));
 
 /**
  * Billable duration (seconds) from CallLog events. Prefers call_answered + call_hangup timestamps, then cdr_push.Duration when ANSWER.
@@ -128,6 +131,31 @@ function extractNodeErrnoCode(err, depth = 0) {
         }
     }
     return undefined;
+}
+
+function isRetryableMongoTransactionError(err) {
+    if (!err) return false;
+
+    if (Array.isArray(err.errorLabels)) {
+        if (err.errorLabels.includes('TransientTransactionError')) return true;
+        if (err.errorLabels.includes('UnknownTransactionCommitResult')) return true;
+    }
+
+    if (err.code === 112 || err.codeName === 'WriteConflict') return true;
+
+    const msg = String(err.message || '').toLowerCase();
+    if (msg.includes('write conflict')) return true;
+    if (msg.includes('temporarily unavailable')) return true;
+    if (msg.includes('lock timeout')) return true;
+
+    return false;
+}
+
+function mongoTxRetryDelayMs(attempt) {
+    const exp = Math.max(0, attempt - 1);
+    const base = Math.min(MONGO_TX_RETRY_CAP_MS, MONGO_TX_RETRY_BASE_MS * (2 ** exp));
+    const jitter = Math.floor(Math.random() * Math.max(25, Math.floor(base * 0.3)));
+    return Math.min(MONGO_TX_RETRY_CAP_MS, base + jitter);
 }
 
 /**
@@ -458,6 +486,16 @@ export class CallWorker {
         const ignoreEndWindow = await shouldIgnoreEndWindow({ campaign, metadata, db });
         if (!ignoreEndWindow && isPastCampaignEnd(campaign)) {
             const endDt = getCampaignEndDateTime(campaign);
+            await db.collection('campaigns').updateOne(
+                { _id: campaign._id, status: { $ne: 'expired' } },
+                {
+                    $set: {
+                        status: 'expired',
+                        expiredAt: new Date(),
+                        updatedAt: new Date()
+                    }
+                }
+            );
             console.log(`⏹️ [Worker] Job ${job.id} ignored: Campaign ${campaignId} is past end window (${endDt?.toISO?.() || 'unknown'}).`);
             return;
         }
@@ -1292,134 +1330,157 @@ export class CallWorker {
             let insufficientCredits = false;
             let callLogMatchedInTx = null;
             const mongoClient = await getMongoClient();
-            const session = mongoClient.startSession();
+            for (let txAttempt = 1; txAttempt <= MONGO_TX_MAX_ATTEMPTS; txAttempt++) {
+                const session = mongoClient.startSession();
+                try {
+                    let attemptAlreadyBilled = false;
+                    let attemptInsufficientCredits = false;
+                    let attemptCallLogMatchedInTx = null;
 
-            try {
-                await session.withTransaction(async () => {
-                    const existingTx = await creditTxCol.findOne(
-                        {
-                            type: 'call_deduction',
-                            'reference.billingKey': billingKey,
-                        },
-                        { session, projection: { _id: 1 } }
-                    );
-                    if (existingTx) {
-                        alreadyBilled = true;
-                        return;
-                    }
-
-                    const userFresh = await db.collection('users').findOne(
-                        { _id: user._id },
-                        { session, projection: { _id: 1, email: 1, credits: 1 } }
-                    );
-                    if (!userFresh) throw new Error(`User ${user._id} not found during billing transaction`);
-
-                    if ((userFresh.credits || 0) < cost) {
-                        insufficientCredits = true;
-                        return;
-                    }
-
-                    const deductionResult = await db.collection('users').updateOne(
-                        { _id: user._id, credits: { $gte: cost } },
-                        {
-                            $inc: { credits: -cost },
-                            $set: { updatedAt: new Date() }
-                        },
-                        { session }
-                    );
-
-                    if (deductionResult.modifiedCount === 0 && cost > 0) {
-                        throw new Error('Credit deduction failed (likely race condition or insufficient funds)');
-                    }
-
-                    const userAfter = await db.collection('users').findOne(
-                        { _id: user._id },
-                        { session, projection: { credits: 1 } }
-                    );
-
-                    await creditTxCol.insertOne(
-                        {
-                            userId: user._id,
-                            userEmail: user.email,
-                            type: 'call_deduction',
-                            amount: -cost,
-                            balanceAfter: parseFloat((userAfter?.credits || 0).toFixed(6)),
-                            description: 'Call Usage',
-                            reference: {
-                                campaignId: campaign._id,
-                                campaignName: campaign.name || campaign.campaignName,
-                                callDuration: durationInSeconds,
-                                callId,
-                                leadId,
-                                billingKey,
-                            },
-                            createdAt: new Date(),
-                            updatedAt: new Date()
-                        },
-                        { session }
-                    );
-
-                    const today = new Date().toISOString().split('T')[0];
-                    await db.collection('analytics').updateOne(
-                        {
-                            userId: user.email,
-                            campaignId: campaign._id.toString(),
-                            date: today
-                        },
-                        {
-                            $inc: {
-                                totalMinutes: parseFloat((durationInSeconds / 60).toFixed(4)),
-                                totalCalls: 1,
-                                connectedCalls: duration > 0 ? 1 : 0
-                            },
-                            $set: { updatedAt: new Date() }
-                        },
-                        { upsert: true, session }
-                    );
-
-                    if (callLogUpdateFilter) {
-                        const logUpdate = await db.collection('CallLogs').updateOne(
-                            callLogUpdateFilter,
+                    await session.withTransaction(async () => {
+                        const existingTx = await creditTxCol.findOne(
                             {
-                                $set: {
-                                    creditsDeducted: true,
-                                    creditsDeductedAmount: cost,
-                                    creditDeductionError: null,
-                                    updatedAt: new Date()
-                                }
+                                type: 'call_deduction',
+                                'reference.billingKey': billingKey,
+                            },
+                            { session, projection: { _id: 1 } }
+                        );
+                        if (existingTx) {
+                            attemptAlreadyBilled = true;
+                            return;
+                        }
+
+                        const userFresh = await db.collection('users').findOne(
+                            { _id: user._id },
+                            { session, projection: { _id: 1, email: 1, credits: 1 } }
+                        );
+                        if (!userFresh) throw new Error(`User ${user._id} not found during billing transaction`);
+
+                        if ((userFresh.credits || 0) < cost) {
+                            attemptInsufficientCredits = true;
+                            return;
+                        }
+
+                        const deductionResult = await db.collection('users').updateOne(
+                            { _id: user._id, credits: { $gte: cost } },
+                            {
+                                $inc: { credits: -cost },
+                                $set: { updatedAt: new Date() }
                             },
                             { session }
                         );
-                        callLogMatchedInTx = logUpdate.matchedCount;
-                    }
-                });
-            } catch (txErr) {
-                const msg = String(txErr?.message || '');
-                const unsupportedTx =
-                    msg.includes('Transaction numbers are only allowed on a replica set') ||
-                    msg.includes('This MongoDB deployment does not support retryable writes');
-                if (unsupportedTx) {
-                    console.error('❌ [Worker] Billing transaction unavailable (MongoDB deployment lacks transaction support). Skipping deduction for safety.');
-                    this.billingHealth.transactionUnavailableSkips += 1;
-                    if (callLogUpdateFilter) {
-                        await db.collection('CallLogs').updateOne(
-                            callLogUpdateFilter,
-                            {
-                                $set: {
-                                    creditsDeducted: false,
-                                    creditDeductionError: 'transactions_unavailable',
-                                    processedAt: new Date(),
-                                    updatedAt: new Date()
-                                }
-                            }
+
+                        if (deductionResult.modifiedCount === 0 && cost > 0) {
+                            throw new Error('Credit deduction failed (likely race condition or insufficient funds)');
+                        }
+
+                        const userAfter = await db.collection('users').findOne(
+                            { _id: user._id },
+                            { session, projection: { credits: 1 } }
                         );
+
+                        await creditTxCol.insertOne(
+                            {
+                                userId: user._id,
+                                userEmail: user.email,
+                                type: 'call_deduction',
+                                amount: -cost,
+                                balanceAfter: parseFloat((userAfter?.credits || 0).toFixed(6)),
+                                description: 'Call Usage',
+                                reference: {
+                                    campaignId: campaign._id,
+                                    campaignName: campaign.name || campaign.campaignName,
+                                    callDuration: durationInSeconds,
+                                    callId,
+                                    leadId,
+                                    billingKey,
+                                },
+                                createdAt: new Date(),
+                                updatedAt: new Date()
+                            },
+                            { session }
+                        );
+
+                        const today = new Date().toISOString().split('T')[0];
+                        await db.collection('analytics').updateOne(
+                            {
+                                userId: user.email,
+                                campaignId: campaign._id.toString(),
+                                date: today
+                            },
+                            {
+                                $inc: {
+                                    totalMinutes: parseFloat((durationInSeconds / 60).toFixed(4)),
+                                    totalCalls: 1,
+                                    connectedCalls: duration > 0 ? 1 : 0
+                                },
+                                $set: { updatedAt: new Date() }
+                            },
+                            { upsert: true, session }
+                        );
+
+                        if (callLogUpdateFilter) {
+                            const logUpdate = await db.collection('CallLogs').updateOne(
+                                callLogUpdateFilter,
+                                {
+                                    $set: {
+                                        creditsDeducted: true,
+                                        creditsDeductedAmount: cost,
+                                        creditDeductionError: null,
+                                        updatedAt: new Date()
+                                    }
+                                },
+                                { session }
+                            );
+                            attemptCallLogMatchedInTx = logUpdate.matchedCount;
+                        }
+                    });
+
+                    alreadyBilled = attemptAlreadyBilled;
+                    insufficientCredits = attemptInsufficientCredits;
+                    callLogMatchedInTx = attemptCallLogMatchedInTx;
+                    break;
+                } catch (txErr) {
+                    const msg = String(txErr?.message || '');
+                    const unsupportedTx =
+                        msg.includes('Transaction numbers are only allowed on a replica set') ||
+                        msg.includes('This MongoDB deployment does not support retryable writes');
+                    if (unsupportedTx) {
+                        console.error('❌ [Worker] Billing transaction unavailable (MongoDB deployment lacks transaction support). Skipping deduction for safety.');
+                        this.billingHealth.transactionUnavailableSkips += 1;
+                        if (callLogUpdateFilter) {
+                            await db.collection('CallLogs').updateOne(
+                                callLogUpdateFilter,
+                                {
+                                    $set: {
+                                        creditsDeducted: false,
+                                        creditDeductionError: 'transactions_unavailable',
+                                        processedAt: new Date(),
+                                        updatedAt: new Date()
+                                    }
+                                }
+                            );
+                        }
+                        return;
                     }
-                    return;
+
+                    const retryable = isRetryableMongoTransactionError(txErr);
+                    const canRetry = retryable && txAttempt < MONGO_TX_MAX_ATTEMPTS;
+                    if (canRetry) {
+                        const waitMs = mongoTxRetryDelayMs(txAttempt);
+                        console.warn(
+                            `⚠️ [Worker] Billing transaction transient error ` +
+                            `(attempt ${txAttempt}/${MONGO_TX_MAX_ATTEMPTS}) for billingKey=${billingKey}. Retrying in ${waitMs}ms. Error: ${txErr.message}`
+                        );
+                        await new Promise(resolve => setTimeout(resolve, waitMs));
+                        continue;
+                    }
+
+                    this.billingHealth.transactionErrors += 1;
+                    throw txErr;
+                } finally {
+                    await session.endSession();
                 }
-                this.billingHealth.transactionErrors += 1;
-                throw txErr;
-            } finally {
-                await session.endSession();
             }
 
             if (alreadyBilled) {
