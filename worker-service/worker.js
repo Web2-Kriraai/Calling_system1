@@ -232,6 +232,50 @@ function isPastCampaignEnd(campaign) {
     return now > endDt;
 }
 
+const KB_USD_PER_INR = Number.parseFloat(process.env.KB_USD_PER_INR || String(1 / 94));
+
+function roundSix(value) {
+    return Number.parseFloat((value || 0).toFixed(6));
+}
+
+function toFiniteNumber(value) {
+    const parsed = Number.parseFloat(value);
+    return Number.isFinite(parsed) ? parsed : null;
+}
+
+function convertInrToUsd(inrValue) {
+    const inr = toFiniteNumber(inrValue);
+    if (inr === null) return 0;
+    return roundSix(inr * KB_USD_PER_INR);
+}
+
+function toObjectIdOrNull(value) {
+    if (!value) return null;
+    try {
+        return new ObjectId(String(value));
+    } catch {
+        return null;
+    }
+}
+
+function extractKnowledgeRefs(campaign) {
+    const refs = new Set();
+    const knowledgeBaseIds = campaign?.selectedKnowledgebases;
+
+    if (Array.isArray(knowledgeBaseIds)) {
+        for (const item of knowledgeBaseIds) {
+            if (!item) continue;
+            if (typeof item === 'string' || typeof item === 'number') {
+                refs.add(String(item));
+                continue;
+            }
+            if (item.fileId) refs.add(String(item.fileId));
+        }
+    }
+
+    return [...refs];
+}
+
 async function shouldIgnoreEndWindow({ campaign, metadata, db }) {
     if (metadata?.ignoreEndWindow === true) return true;
     // Fallback for already-enqueued jobs that don't have metadata.ignoreEndWindow yet:
@@ -350,6 +394,37 @@ export class CallWorker {
             this.postCallWorker.close(),
             this.postCallQueue.close()
         ]);
+    }
+
+    async resolveKbRatePerMinute(db, campaign) {
+        const selectedFileIds = extractKnowledgeRefs(campaign);
+        let docs = [];
+
+        try {
+            if (selectedFileIds.length > 0) {
+                docs = await db.collection('knowledges').find({
+                    'pdfDocuments.fileId': { $in: selectedFileIds }
+                }).toArray();
+            }
+        } catch (error) {
+            console.warn(`⚠️ [Worker] Failed loading knowledges for campaign ${campaign?._id}: ${error.message}`);
+            return 0;
+        }
+
+        let kbRatePerMinute = 0;
+        for (const doc of docs) {
+            const pdfDocuments = Array.isArray(doc?.pdfDocuments) ? doc.pdfDocuments : [];
+            for (const fileDoc of pdfDocuments) {
+                if (!fileDoc?.fileId || !selectedFileIds.includes(String(fileDoc.fileId))) continue;
+                // Strict source: only from knowledges.pdfDocuments.metadata.kbRatePerMinute (stored in INR/min).
+                const direct = toFiniteNumber(fileDoc?.metadata?.kbRatePerMinute);
+                if (direct !== null && direct >= 0) {
+                    kbRatePerMinute += convertInrToUsd(direct);
+                }
+            }
+        }
+
+        return roundSix(kbRatePerMinute);
     }
 
     async ensureBillingIndexes(db) {
@@ -1313,6 +1388,11 @@ export class CallWorker {
                 ratePerMinute = 0.08;
             }
 
+            const kbRatePerMinute = await this.resolveKbRatePerMinute(db, campaign);
+            const totalRatePerMinute = roundSix(ratePerMinute + kbRatePerMinute);
+            console.log(
+                `💳 [Worker] Billing rates — plan: ${ratePerMinute}/min, kb: ${kbRatePerMinute}/min, total: ${totalRatePerMinute}/min`
+            );
             const stableCallId =
                 callId && !String(callId).startsWith('call_')
                     ? String(callId)
@@ -1368,7 +1448,7 @@ export class CallWorker {
                 partialMinuteFraction = (bracket?.percentOfRatePerMinute ?? 100) / 100;
             }
 
-            const cost = parseFloat(((fullMinutes * ratePerMinute) + (partialMinuteFraction * ratePerMinute)).toFixed(6));
+            const cost = parseFloat(((fullMinutes * totalRatePerMinute) + (partialMinuteFraction * totalRatePerMinute)).toFixed(6));
             const creditTxCol = db.collection('credittransactions');
             await this.ensureBillingIndexes(db);
 
@@ -1425,27 +1505,6 @@ export class CallWorker {
                             { session, projection: { credits: 1 } }
                         );
 
-                        await creditTxCol.insertOne(
-                            {
-                                userId: user._id,
-                                userEmail: user.email,
-                                type: 'call_deduction',
-                                amount: -cost,
-                                balanceAfter: parseFloat((userAfter?.credits || 0).toFixed(6)),
-                                description: 'Call Usage',
-                                reference: {
-                                    campaignId: campaign._id,
-                                    campaignName: campaign.name || campaign.campaignName,
-                                    callDuration: durationInSeconds,
-                                    callId,
-                                    leadId,
-                                    billingKey,
-                                },
-                                createdAt: new Date(),
-                                updatedAt: new Date()
-                            },
-                            { session }
-                        );
 
                         const today = new Date().toISOString().split('T')[0];
                         await db.collection('analytics').updateOne(
@@ -1557,63 +1616,134 @@ export class CallWorker {
                 return;
             }
 
-            if (callLogUpdateFilter && callLogMatchedInTx === 0) {
-                console.warn(`⚠️ [Worker] No CallLog matched for creditsDeducted update (callId=${callId}, leadId=${leadId ?? 'N/A'})`);
-            }
-            this.billingHealth.deductedCalls += 1;
-            this.billingHealth.deductedAmount += Number(cost || 0);
-
-            console.log(
-                `✅ [Worker] Post-call actions completed for ${callId}. Cost: ${cost} (billing attempts used: ${billingAttemptsUsed}/${CALL_CREDIT_MAX_ATTEMPTS})`
+            const deductionResult = await db.collection('users').updateOne(
+                { _id: user._id, credits: { $gte: cost } },
+                {
+                    $inc: { credits: -cost },
+                    $set: { updatedAt: new Date() }
+                }
             );
 
-            // 8. Trigger Call Analysis API (retries: indexing often lags a few seconds after call end)
-            if (callId && !String(callId).startsWith('call_')) {
-                try {
-                    // Give transcript/turns pipeline a brief head start before first analysis request.
-                    if (ANALYSIS_API_INITIAL_DELAY_MS > 0) {
-                        await new Promise(r => setTimeout(r, ANALYSIS_API_INITIAL_DELAY_MS));
-                    }
-
-                    // ANALYSIS_API_URL can be base (http://host:5000) or prefix (http://host:5000/analyze/call)
-                    const rawAnalysis = (config.analysis?.apiUrl || 'http://72.60.221.48:5000').replace(/\/$/, '');
-                    const analysisUrl = rawAnalysis.includes('/analyze/call')
-                        ? `${rawAnalysis}/${encodeURIComponent(String(callId))}`
-                        : `${rawAnalysis}/analyze/call/${encodeURIComponent(String(callId))}`;
-
-                    for (let attempt = 1; attempt <= ANALYSIS_API_MAX_ATTEMPTS; attempt++) {
-                        console.log(`🧠 [Worker] Triggering Analysis API for Call ID: ${callId} (attempt ${attempt}/${ANALYSIS_API_MAX_ATTEMPTS})...`);
-                        const analysisResponse = await fetch(analysisUrl, {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' }
-                        });
-
-                        if (analysisResponse.ok) {
-                            console.log(`✅ [Worker] Analysis API triggered successfully for ${callId}`);
-                            break;
-                        }
-
-                        const errText = await analysisResponse.text();
-                        const notReady =
-                            analysisResponse.status === 404 ||
-                            analysisResponse.status === 503 ||
-                            analysisResponse.status === 502 ||
-                            /not\s*found/i.test(errText);
-
-                        if (notReady && attempt < ANALYSIS_API_MAX_ATTEMPTS) {
-                            console.warn(`⚠️ [Worker] Analysis API not ready for ${callId} (${analysisResponse.status}), retry in ${ANALYSIS_API_RETRY_MS}ms...`);
-                            await new Promise(r => setTimeout(r, ANALYSIS_API_RETRY_MS));
-                            continue;
-                        }
-
-                        console.warn(`⚠️ [Worker] Analysis API failed for ${callId}:`, errText);
-                        break;
-                    }
-                } catch (analysisError) {
-                    console.error(`❌ [Worker] Error triggering Analysis API:`, analysisError.message);
-                }
+            if (deductionResult.modifiedCount === 0 && cost > 0) {
+                throw new Error('Credit deduction failed (likely race condition or insufficient funds)');
             }
 
+            // 5. Log Transaction
+            await db.collection('credittransactions').insertOne({
+                userId: user._id,
+                userEmail: user.email,
+                type: 'call_deduction',
+                amount: -cost,
+                balanceAfter: parseFloat(((user.credits || 0) - cost).toFixed(6)),
+                description: `Call Usage`,
+                reference: {
+                    campaignId: campaign._id,
+                    campaignName: campaign.name || campaign.campaignName,
+                    callDuration: durationInSeconds,
+                    callId: callId,
+                    leadId: leadId,
+                    planRatePerMinute: roundSix(ratePerMinute),
+                    kbRatePerMinute,
+                    totalRatePerMinute
+                },
+                createdAt: new Date(),
+                updatedAt: new Date()
+            });
+
+            // 6. Update Analytics (Using 'analytics' collection based on DB check)
+            const today = new Date().toISOString().split('T')[0];
+            await db.collection('analytics').updateOne(
+                {
+                    userId: user.email, // Analytics uses email or ID? DB check showed 'niya@gmail.com'
+                    campaignId: campaign._id.toString(),
+                    date: today
+                },
+                {
+                    $inc: {
+                        totalMinutes: parseFloat((durationInSeconds / 60).toFixed(4)),
+                        totalCalls: 1,
+                        connectedCalls: duration > 0 ? 1 : 0
+                    },
+                    $set: { updatedAt: new Date() }
+                },
+                { upsert: true }
+            );
+
+            // 7. Update Call Log (by call_id so we update the current attempt, not a previous one for same contact)
+            if (callLogUpdateFilter) {
+                const logUpdate = await db.collection('CallLogs').updateOne(
+                    callLogUpdateFilter,
+                    {
+                        $set: {
+                            creditsDeducted: true,
+                            creditsDeductedAmount: cost,
+                            planRatePerMinute: roundSix(ratePerMinute),
+                            kbRatePerMinute,
+                            totalRatePerMinute,
+                            updatedAt: new Date()
+                        }
+                    }
+                );
+                if (logUpdate.matchedCount === 0) {
+                    console.warn(`⚠️ [Worker] No CallLog matched for creditsDeducted update (callId=${callId}, leadId=${leadId ?? 'N/A'})`);
+                }
+                if (callLogUpdateFilter && callLogMatchedInTx === 0) {
+                    console.warn(`⚠️ [Worker] No CallLog matched for creditsDeducted update (callId=${callId}, leadId=${leadId ?? 'N/A'})`);
+                }
+                this.billingHealth.deductedCalls += 1;
+                this.billingHealth.deductedAmount += Number(cost || 0);
+
+                console.log(
+                    `✅ [Worker] Post-call actions completed for ${callId}. Cost: ${cost} (billing attempts used: ${billingAttemptsUsed}/${CALL_CREDIT_MAX_ATTEMPTS})`
+                );
+
+                // 8. Trigger Call Analysis API (retries: indexing often lags a few seconds after call end)
+                if (callId && !String(callId).startsWith('call_')) {
+                    try {
+                        // Give transcript/turns pipeline a brief head start before first analysis request.
+                        if (ANALYSIS_API_INITIAL_DELAY_MS > 0) {
+                            await new Promise(r => setTimeout(r, ANALYSIS_API_INITIAL_DELAY_MS));
+                        }
+
+                        // ANALYSIS_API_URL can be base (http://host:5000) or prefix (http://host:5000/analyze/call)
+                        const rawAnalysis = (config.analysis?.apiUrl || 'http://72.60.221.48:5000').replace(/\/$/, '');
+                        const analysisUrl = rawAnalysis.includes('/analyze/call')
+                            ? `${rawAnalysis}/${encodeURIComponent(String(callId))}`
+                            : `${rawAnalysis}/analyze/call/${encodeURIComponent(String(callId))}`;
+
+                        for (let attempt = 1; attempt <= ANALYSIS_API_MAX_ATTEMPTS; attempt++) {
+                            console.log(`🧠 [Worker] Triggering Analysis API for Call ID: ${callId} (attempt ${attempt}/${ANALYSIS_API_MAX_ATTEMPTS})...`);
+                            const analysisResponse = await fetch(analysisUrl, {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' }
+                            });
+
+                            if (analysisResponse.ok) {
+                                console.log(`✅ [Worker] Analysis API triggered successfully for ${callId}`);
+                                break;
+                            }
+
+                            const errText = await analysisResponse.text();
+                            const notReady =
+                                analysisResponse.status === 404 ||
+                                analysisResponse.status === 503 ||
+                                analysisResponse.status === 502 ||
+                                /not\s*found/i.test(errText);
+
+                            if (notReady && attempt < ANALYSIS_API_MAX_ATTEMPTS) {
+                                console.warn(`⚠️ [Worker] Analysis API not ready for ${callId} (${analysisResponse.status}), retry in ${ANALYSIS_API_RETRY_MS}ms...`);
+                                await new Promise(r => setTimeout(r, ANALYSIS_API_RETRY_MS));
+                                continue;
+                            }
+
+                            console.warn(`⚠️ [Worker] Analysis API failed for ${callId}:`, errText);
+                            break;
+                        }
+                    } catch (analysisError) {
+                        console.error(`❌ [Worker] Error triggering Analysis API:`, analysisError.message);
+                    }
+                }
+            }
         } catch (error) {
             console.error(`❌ [Worker] triggerPostCallActions CRITICAL ERROR:`, error.message);
             await this.logErrorToDb({
