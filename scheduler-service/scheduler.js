@@ -921,6 +921,7 @@ export class Scheduler {
 
     async expireCampaignIfPastEndWindow({ campaign, db, context = 'scheduler', ignoreEndWindow }) {
         if (!campaign || campaign.tillCallsComplete === true) return false;
+        if (campaign.status === 'draft') return false;
 
         let shouldIgnoreEndWindow = ignoreEndWindow === true;
         if (ignoreEndWindow !== true && campaign.googleSheetsDataId) {
