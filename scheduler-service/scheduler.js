@@ -647,7 +647,7 @@ export class Scheduler {
                 { immediateStart: true },
                 { customizeSchedule: false }
             ],
-            status: { $nin: ['active', 'completed', 'paused', 'failed'] },
+            status: { $nin: ['active', 'completed', 'paused', 'failed', 'expired'] },
             archive: { $ne: true }
         }).toArray();
 
@@ -657,6 +657,10 @@ export class Scheduler {
 
         for (const campaign of pendingCampaigns) {
             const campaignId = campaign._id;
+            const isExpiredByWindow = await this.expireCampaignIfPastEndWindow({ campaign, db, context: 'immediateStart activation' });
+            if (isExpiredByWindow) {
+                continue;
+            }
 
             // Check if the campaign script has been generated yet
             const script = await db.collection('campaign_scripts').findOne({
@@ -741,6 +745,10 @@ export class Scheduler {
             // Skip immediateStart campaigns here as they are handled by activateImmediateStartCampaigns
             const isImmediate = campaign.immediateStart === true || campaign.customizeSchedule === false;
             if (isImmediate) continue;
+            const isExpiredByWindow = await this.expireCampaignIfPastEndWindow({ campaign, db, context: 'scheduled activation' });
+            if (isExpiredByWindow) {
+                continue;
+            }
 
             // 1. Check if the campaign script has been generated yet
             const script = await db.collection('campaign_scripts').findOne({
@@ -844,6 +852,82 @@ export class Scheduler {
         };
     }
 
+    getCampaignEndDateTime(campaign) {
+        if (!campaign?.endDate) return null;
+        const tz = campaign.timezone || 'Asia/Kolkata';
+        let zone = 'Asia/Kolkata';
+        if (typeof tz === 'string') {
+            if (tz.includes('Chennai') || tz.includes('Kolkata') || tz.includes('Mumbai')) {
+                zone = 'Asia/Kolkata';
+            } else {
+                const match = tz.match(/UTC([+-]\d+:\d+)/);
+                zone = match ? `UTC${match[1]}` : tz;
+            }
+        }
+
+        const endDateISO = (campaign.endDate instanceof Date)
+            ? DateTime.fromJSDate(campaign.endDate).toISODate()
+            : (typeof campaign.endDate === 'string' ? (campaign.endDate.match(/^(\d{4}-\d{2}-\d{2})/)?.[1] || null) : null);
+        if (!endDateISO) return null;
+
+        let endDt = DateTime.fromISO(endDateISO, { zone }).endOf('day');
+        if (typeof campaign.endTime === 'string' && campaign.endTime.trim()) {
+            const t = campaign.endTime.trim();
+            const formats = ['HH:mm:ss', 'HH:mm', 'h:mm a', 'h:mm:ss a'];
+            for (const fmt of formats) {
+                const parsed = DateTime.fromFormat(t, fmt, { zone: 'UTC' });
+                if (parsed.isValid) {
+                    endDt = DateTime.fromISO(endDateISO, { zone }).set({
+                        hour: parsed.hour,
+                        minute: parsed.minute,
+                        second: parsed.second,
+                        millisecond: 0
+                    });
+                    break;
+                }
+            }
+        }
+        return endDt.isValid ? endDt : null;
+    }
+
+    async expireCampaignIfPastEndWindow({ campaign, db, context = 'scheduler', ignoreEndWindow }) {
+        if (!campaign || campaign.tillCallsComplete === true) return false;
+
+        let shouldIgnoreEndWindow = ignoreEndWindow === true;
+        if (ignoreEndWindow !== true && campaign.googleSheetsDataId) {
+            try {
+                const sheetDoc = await db.collection('googlesheetsdatas').findOne({
+                    _id: new ObjectId(campaign.googleSheetsDataId)
+                });
+                shouldIgnoreEndWindow = sheetDoc?.autoSyncEnabled === true;
+            } catch (err) {
+                console.warn(`[Scheduler] Could not fetch GoogleSheetsData for campaign ${campaign._id}:`, err.message);
+            }
+        }
+        if (shouldIgnoreEndWindow) return false;
+
+        const endDt = this.getCampaignEndDateTime(campaign);
+        if (!endDt) return false;
+
+        const now = DateTime.now().setZone(endDt.zoneName);
+        if (now <= endDt) return false;
+
+        const updated = await db.collection('campaigns').updateOne(
+            { _id: campaign._id, status: { $ne: 'expired' } },
+            {
+                $set: {
+                    status: 'expired',
+                    expiredAt: new Date(),
+                    updatedAt: new Date()
+                }
+            }
+        );
+        if (updated.modifiedCount > 0) {
+            console.log(`⌛ [Scheduler] Campaign ${campaign.campaignName} (${campaign._id}) marked expired in ${context}; end window was ${endDt.toISO()}.`);
+        }
+        return true;
+    }
+
     /**
      * Processes a single campaign by scanning pending contacts.
      */
@@ -862,56 +946,15 @@ export class Scheduler {
                 console.warn(`[Scheduler] Could not fetch GoogleSheetsData for campaign ${campaign._id}:`, err.message);
             }
         }
-
-        // End window guard: if endDate/endTime is passed and tillCallsComplete !== true, do not enqueue new calls.
-        let onlyFollowUps = false;
-        try {
-            if (!ignoreEndWindow && campaign?.tillCallsComplete !== true && campaign?.endDate) {
-                const tz = campaign.timezone || 'Asia/Kolkata';
-                let zone = 'Asia/Kolkata';
-                if (typeof tz === 'string') {
-                    if (tz.includes('Chennai') || tz.includes('Kolkata') || tz.includes('Mumbai')) {
-                        zone = 'Asia/Kolkata';
-                    } else {
-                        const match = tz.match(/UTC([+-]\d+:\d+)/);
-                        zone = match ? `UTC${match[1]}` : tz;
-                    }
-                }
-
-                const endDateISO = (campaign.endDate instanceof Date)
-                    ? DateTime.fromJSDate(campaign.endDate).toISODate()
-                    : (typeof campaign.endDate === 'string' ? (campaign.endDate.match(/^(\d{4}-\d{2}-\d{2})/)?.[1] || null) : null);
-
-                if (endDateISO) {
-                    // Default to end-of-day if endTime is missing/unparseable.
-                    let endDt = DateTime.fromISO(endDateISO, { zone }).endOf('day');
-
-                    if (typeof campaign.endTime === 'string' && campaign.endTime.trim()) {
-                        const t = campaign.endTime.trim();
-                        const formats = ['HH:mm:ss', 'HH:mm', 'h:mm a', 'h:mm:ss a'];
-                        for (const fmt of formats) {
-                            const parsed = DateTime.fromFormat(t, fmt, { zone: 'UTC' });
-                            if (parsed.isValid) {
-                                endDt = DateTime.fromISO(endDateISO, { zone }).set({
-                                    hour: parsed.hour,
-                                    minute: parsed.minute,
-                                    second: parsed.second,
-                                    millisecond: 0
-                                });
-                                break;
-                            }
-                        }
-                    }
-
-                    const now = DateTime.now().setZone(endDt.zoneName);
-                    if (endDt.isValid && now > endDt) {
-                        onlyFollowUps = true; // Block regular contacts, let follow-ups through
-                    }
-                }
-            }
-        } catch (e) {
-            // Never block scheduler loop because of end-window parsing issues
-            console.warn(`⚠️ [Scheduler] End window check failed for campaign ${campaign?._id}:`, e.message);
+        // End window guard: if endDate/endTime is passed and tillCallsComplete !== true, mark campaign expired and stop scheduling.
+        const isExpiredByWindow = await this.expireCampaignIfPastEndWindow({
+            campaign,
+            db,
+            context: 'campaign processing',
+            ignoreEndWindow
+        });
+        if (isExpiredByWindow) {
+            return;
         }
 
         if (!isWithinBusinessHours(campaign)) {
@@ -919,7 +962,7 @@ export class Scheduler {
             return;
         }
 
-        console.log(`📡 [Scheduler] Processing campaign: ${campaign.campaignName} (${campaign._id}) ${onlyFollowUps ? '(Follow-ups ONLY)' : ''}`);
+        console.log(`📡 [Scheduler] Processing campaign: ${campaign.campaignName} (${campaign._id})`);
 
         // Fetch the user's purchased concurrent call limit from the DB
         // The limit is stored per-phone-number in user.phoneNumbers[].concurrentCalls
@@ -965,11 +1008,6 @@ export class Scheduler {
                 }
             ]
         };
-
-        // If we are past the end date, only pick up explicitly marked follow-up contacts
-        if (onlyFollowUps) {
-            contactQuery.isFollowUp = true;
-        }
 
         const contactCursor = db.collection('contactprocessings').find(contactQuery)
             .project({ _id: 1, phone: 1, mobileNumber: 1, userId: 1, isVip: 1, retryCount: 1, isFollowUp: 1 });
