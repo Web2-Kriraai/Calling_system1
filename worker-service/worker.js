@@ -814,8 +814,10 @@ export class CallWorker {
             console.log(`🔍 [Worker] Final Status for ${contactId}: DB=${callStatus}`);
 
             const configuredMaxRetries = Number(metadata.maxRetryAttempts);
+            // Business rule: maxRetryAttempts represents TOTAL call attempts allowed.
+            // Example: 2 => total 2 calls (not 3).
             const maxRetries = Number.isFinite(configuredMaxRetries)
-                ? Math.max(0, configuredMaxRetries)
+                ? Math.max(1, configuredMaxRetries)
                 : 3;
             const retryDelayMinutes = metadata.retryDelayMinutes || 30;
             const decisionContact = latestContactForDecision || currentContact;
@@ -886,17 +888,14 @@ export class CallWorker {
                 }
             } else {
                 // FAILED (0) or NOT RECEIVED (1): Persist immediately; nextRetryAt from attempt start so delay is not inflated by polling
-                // retryCount tracks failed attempts already consumed; allow retries until it reaches maxRetries
-                const isRetryable = currentRetryCount < maxRetries;
+                // Business rule: retry only while current attempt count is still below max total attempts.
+                const isRetryable = currentAttempts < maxRetries;
                 const baseTime = attemptStartedAt > 0 ? attemptStartedAt : Date.now();
-                const shouldScheduleFallbackFollowUp =
-                    !isRetryable &&
-                    callStatus === 1 &&
-                    campaign?.followup === true &&
-                    !decisionContact?.isFollowUp;
-                const nextStatus = shouldScheduleFallbackFollowUp
-                    ? 'pending'
-                    : (isRetryable ? 'retry' : 'failed');
+                // Business rule: do NOT auto-create fallback follow-ups for unanswered calls.
+                // Follow-ups should be driven only by successful call analysis (user asked to call later).
+                const shouldScheduleFallbackFollowUp = false;
+                const isFollowUpContact = decisionContact?.isFollowUp === true;
+                const nextStatus = isRetryable ? 'retry' : 'failed';
                 const nextRetryAt = isRetryable ? new Date(baseTime + retryDelayMinutes * 60000) : null;
                 const followUpScheduledAt = shouldScheduleFallbackFollowUp
                     ? new Date(baseTime + retryDelayMinutes * 60000)
@@ -928,7 +927,12 @@ export class CallWorker {
                     updateDoc.$set.lastFollowUpAt = new Date();
                     updateDoc.$set.retryCount = 0;
                 } else {
-                    updateDoc.$inc = { retryCount: 1 };
+                    if (isFollowUpContact) {
+                        // Business rule: follow-up failure should not keep retry debt.
+                        updateDoc.$set.retryCount = 0;
+                    } else {
+                        updateDoc.$inc = { retryCount: 1 };
+                    }
                 }
 
                 const retryWriteResult = await db.collection('contactprocessings').updateOne(
@@ -1015,15 +1019,15 @@ export class CallWorker {
             const campaignForError = await db.collection('campaigns').findOne({ _id: new ObjectId(campaignId) });
             const configuredMaxRetries = Number(metadata.maxRetryAttempts);
             const maxRetries = Number.isFinite(configuredMaxRetries)
-                ? Math.max(0, configuredMaxRetries)
+                ? Math.max(1, configuredMaxRetries)
                 : 3;
             const retryDelayMinutes = metadata.retryDelayMinutes || 30;
-            const currentRetryCount = contact?.retryCount || 0;
             const currentAttempts = (contact?.callAttempts?.length || 0) + 1;
-
-            const isRetryable = currentRetryCount < maxRetries;
+            const isRetryable = currentAttempts < maxRetries;
             const status = isRetryable ? 'retry' : 'failed';
             const nextRetryAt = isRetryable ? new Date(Date.now() + retryDelayMinutes * 60000) : null;
+            const isFollowUpContact = contact?.isFollowUp === true;
+            const nextRetryCount = isFollowUpContact ? 0 : ((contact?.retryCount || 0) + 1);
 
             await db.collection('contactprocessings').updateOne(
                 { _id: contactObjId },
@@ -1032,9 +1036,9 @@ export class CallWorker {
                         status,
                         lastError: error.message,
                         nextRetryAt,
+                        retryCount: nextRetryCount,
                         updatedAt: new Date()
                     },
-                    $inc: { retryCount: 1 },
                     $push: {
                         callAttempts: {
                             attempt: currentAttempts,
@@ -1067,7 +1071,7 @@ export class CallWorker {
                     jobId: job.id,
                     callReceiveStatus: contact?.callReceiveStatus,
                     retryStatus: status,
-                    retryCountAfterUpdate: (contact?.retryCount || 0) + 1
+                    retryCountAfterUpdate: nextRetryCount
                 }
             });
 
