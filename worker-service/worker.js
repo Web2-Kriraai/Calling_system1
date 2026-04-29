@@ -579,6 +579,11 @@ export class CallWorker {
             return;
         }
 
+        if (campaign.awaitingFinalSubmit === true) {
+            console.log(`🧪 [Worker] Job ${job.id} for campaign ${campaignId} ignored: awaiting explicit finish-testing submit.`);
+            return;
+        }
+
         if (isCampaignBlockedByTestCall(campaign)) {
             console.log(`🧪 [Worker] Job ${job.id} for campaign ${campaignId} ignored: Campaign is testing (set testCallStatus to 'passed' after successful test call).`);
             return;
