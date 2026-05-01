@@ -232,8 +232,6 @@ function isPastCampaignEnd(campaign) {
     return now > endDt;
 }
 
-const KB_USD_PER_INR = Number.parseFloat(process.env.KB_USD_PER_INR || String(1 / 94));
-
 function roundSix(value) {
     return Number.parseFloat((value || 0).toFixed(6));
 }
@@ -243,10 +241,11 @@ function toFiniteNumber(value) {
     return Number.isFinite(parsed) ? parsed : null;
 }
 
-function convertInrToUsd(inrValue) {
-    const inr = toFiniteNumber(inrValue);
-    if (inr === null) return 0;
-    return roundSix(inr * KB_USD_PER_INR);
+/** KB add-on rate stored on campaign at create/update time (USD/min); worker does not read knowledges or word counts. */
+function kbRatePerMinuteFromCampaign(campaign) {
+    const v = toFiniteNumber(campaign?.kbRatePerMinute);
+    if (v === null || v < 0) return 0;
+    return roundSix(v);
 }
 
 function toObjectIdOrNull(value) {
@@ -256,24 +255,6 @@ function toObjectIdOrNull(value) {
     } catch {
         return null;
     }
-}
-
-function extractKnowledgeRefs(campaign) {
-    const refs = new Set();
-    const knowledgeBaseIds = campaign?.selectedKnowledgebases;
-
-    if (Array.isArray(knowledgeBaseIds)) {
-        for (const item of knowledgeBaseIds) {
-            if (!item) continue;
-            if (typeof item === 'string' || typeof item === 'number') {
-                refs.add(String(item));
-                continue;
-            }
-            if (item.fileId) refs.add(String(item.fileId));
-        }
-    }
-
-    return [...refs];
 }
 
 async function shouldIgnoreEndWindow({ campaign, metadata, db }) {
@@ -394,37 +375,6 @@ export class CallWorker {
             this.postCallWorker.close(),
             this.postCallQueue.close()
         ]);
-    }
-
-    async resolveKbRatePerMinute(db, campaign) {
-        const selectedFileIds = extractKnowledgeRefs(campaign);
-        let docs = [];
-
-        try {
-            if (selectedFileIds.length > 0) {
-                docs = await db.collection('knowledges').find({
-                    'pdfDocuments.fileId': { $in: selectedFileIds }
-                }).toArray();
-            }
-        } catch (error) {
-            console.warn(`⚠️ [Worker] Failed loading knowledges for campaign ${campaign?._id}: ${error.message}`);
-            return 0;
-        }
-
-        let kbRatePerMinute = 0;
-        for (const doc of docs) {
-            const pdfDocuments = Array.isArray(doc?.pdfDocuments) ? doc.pdfDocuments : [];
-            for (const fileDoc of pdfDocuments) {
-                if (!fileDoc?.fileId || !selectedFileIds.includes(String(fileDoc.fileId))) continue;
-                // Strict source: only from knowledges.pdfDocuments.metadata.kbRatePerMinute (stored in INR/min).
-                const direct = toFiniteNumber(fileDoc?.metadata?.kbRatePerMinute);
-                if (direct !== null && direct >= 0) {
-                    kbRatePerMinute += convertInrToUsd(direct);
-                }
-            }
-        }
-
-        return roundSix(kbRatePerMinute);
     }
 
     async ensureBillingIndexes(db) {
@@ -1397,7 +1347,7 @@ export class CallWorker {
                 ratePerMinute = 0.08;
             }
 
-            const kbRatePerMinute = await this.resolveKbRatePerMinute(db, campaign);
+            const kbRatePerMinute = kbRatePerMinuteFromCampaign(campaign);
             const totalRatePerMinute = roundSix(ratePerMinute + kbRatePerMinute);
             console.log(
                 `💳 [Worker] Billing rates — plan: ${ratePerMinute}/min, kb: ${kbRatePerMinute}/min, total: ${totalRatePerMinute}/min`
