@@ -599,6 +599,7 @@ export class Scheduler {
         // 1. Find active or processing campaigns
         const activeCampaigns = await db.collection('campaigns').find({
             status: { $in: ['active', 'processing'] },
+            awaitingFinalSubmit: { $ne: true },
             archive: { $ne: true }
         }).toArray();
 
@@ -676,7 +677,8 @@ export class Scheduler {
                 { immediateStart: true },
                 { customizeSchedule: false }
             ],
-            status: { $nin: ['active', 'completed', 'paused', 'failed', 'expired'] },
+            status: { $nin: ['active', 'completed', 'paused', 'failed', 'expired', 'testing'] },
+            awaitingFinalSubmit: { $ne: true },
             archive: { $ne: true }
         }).toArray();
 
@@ -765,11 +767,20 @@ export class Scheduler {
         // Find campaigns that are scheduled or active (to verify if they should still be active)
         const candidates = await db.collection('campaigns').find({
             status: { $in: ['active', 'scheduled', 'processing', 'draft', 'error', 'pending', 'testing'] },
+            awaitingFinalSubmit: { $ne: true },
             archive: { $ne: true }
         }).toArray();
 
         for (const campaign of candidates) {
             const campaignId = campaign._id;
+            if (campaign.awaitingFinalSubmit === true) {
+                continue;
+            }
+            // Testing campaigns must only transition via explicit finish-testing API.
+            // Never auto-activate/schedule from scheduler loops.
+            if (campaign.status === 'testing') {
+                continue;
+            }
 
             // Skip immediateStart campaigns here as they are handled by activateImmediateStartCampaigns
             const isImmediate = campaign.immediateStart === true || campaign.customizeSchedule === false;
