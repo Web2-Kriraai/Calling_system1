@@ -556,9 +556,51 @@
 //     }
 // }
 
-import { getDb, createQueue, calculatePriority, isWithinBusinessHours, parseISTTimeToDate, isCampaignBlockedByTestCall } from 'shared-lib';
+import {
+    getDb,
+    createQueue,
+    calculatePriority,
+    isWithinBusinessHours,
+    parseISTTimeToDate,
+    isCampaignBlockedByTestCall,
+    extractAnalysisClassificationCategory,
+    DEFAULT_CLASSIFICATION_RETRY_CATEGORIES
+} from 'shared-lib';
 import { ObjectId } from 'mongodb';
 import { DateTime } from 'luxon';
+
+/**
+ * Categories that trigger a classification-based retry (independent of Next_Action / follow-up).
+ * Override with env: CLASSIFICATION_RETRY_CATEGORIES="Voice Mail,Other - Incomplete Call"
+ */
+function getClassificationRetryCategories() {
+    const disabled = process.env.CLASSIFICATION_RETRY_ENABLED;
+    if (disabled === '0' || disabled === 'false') {
+        return [];
+    }
+    const raw = process.env.CLASSIFICATION_RETRY_CATEGORIES;
+    if (typeof raw === 'string' && raw.trim()) {
+        const parsed = raw
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean);
+        if (parsed.length > 0) return parsed;
+    }
+    return [...DEFAULT_CLASSIFICATION_RETRY_CATEGORIES];
+}
+
+/** Matches analysis rows where Category is one of the configured values (either key casing). */
+function buildClassificationCategoryQuery(categories) {
+    if (!categories || categories.length === 0) {
+        return { _id: { $exists: false } };
+    }
+    return {
+        $or: [
+            { 'analysis_data.classification.Category': { $in: categories } },
+            { 'analysis_data.Classification.Category': { $in: categories } }
+        ]
+    };
+}
 
 export class Scheduler {
     constructor() {
@@ -592,8 +634,9 @@ export class Scheduler {
             await this.initializeFollowUpEngine(db);
             this.isFollowUpEngineStarted = true;
         } else {
-            // Periodic Reconciliation (The watcher handles real-time)
+            // Periodic Reconciliation (The watchers handle real-time)
             await this.processFollowUps(db);
+            await this.processClassificationRetries(db);
         }
 
         // 1. Find active or processing campaigns
@@ -1127,7 +1170,17 @@ export class Scheduler {
             'analysis_data.Next_Action.Type': { $regex: /^call$/i }
         });
 
-        if (pendingCount === 0 && pendingAnalyses === 0) {
+        const classificationCategories = getClassificationRetryCategories();
+        const pendingClassificationRetries =
+            classificationCategories.length > 0
+                ? await db.collection('call_analysis').countDocuments({
+                      campaign_id: campaign._id.toString(),
+                      classificationRetryProcessed: { $ne: true },
+                      ...buildClassificationCategoryQuery(classificationCategories)
+                  })
+                : 0;
+
+        if (pendingCount === 0 && pendingAnalyses === 0 && pendingClassificationRetries === 0) {
             // If campaign uses Google Sheet with auto-sync, don't complete until autoSyncUntilDate
             let canComplete = true;
             if (campaign.googleSheetsDataId) {
@@ -1197,13 +1250,15 @@ export class Scheduler {
      * 2. A background polling loop (Reconciliation)
      */
     async initializeFollowUpEngine(db) {
-        console.log('🛠️ [Scheduler] Initializing High-Scale Follow-up Engine...');
+        console.log('🛠️ [Scheduler] Initializing High-Scale Follow-up + Classification Retry engines...');
 
-        // 1. Kick off real-time watcher (Production Ready)
+        // 1. Kick off real-time watchers (Production Ready)
         this.startAnalysisWatcher(db);
+        this.startClassificationRetryWatcher(db);
 
-        // 2. Perform initial reconciliation poll to catch any records from while we were down
+        // 2. Perform initial reconciliation polls to catch any records from while we were down
         await this.processFollowUps(db);
+        await this.processClassificationRetries(db);
     }
 
     /**
@@ -1521,6 +1576,333 @@ export class Scheduler {
 
         } catch (error) {
             console.error('❌ [Scheduler] processBatchOfAnalyses failed:', error.message);
+        }
+    }
+
+    /**
+     * REAL-TIME: Inserts on call_analysis whose classification.Category triggers a retry (not follow-up / Next_Action).
+     */
+    async startClassificationRetryWatcher(db) {
+        const categories = getClassificationRetryCategories();
+        if (categories.length === 0) {
+            console.log('ℹ️ [Scheduler] Classification retry watcher disabled (no categories configured).');
+            return;
+        }
+        try {
+            console.log('👀 [Scheduler] Starting classification retry analysis watcher...');
+
+            const pipeline = [
+                {
+                    $match: {
+                        operationType: 'insert',
+                        'fullDocument.classificationRetryProcessed': { $ne: true },
+                        $or: [
+                            { 'fullDocument.analysis_data.classification.Category': { $in: categories } },
+                            { 'fullDocument.analysis_data.Classification.Category': { $in: categories } }
+                        ]
+                    }
+                }
+            ];
+
+            const changeStream = db.collection('call_analysis').watch(pipeline, { fullDocument: 'updateLookup' });
+
+            changeStream.on('change', async (change) => {
+                const analysis = change.fullDocument;
+                if (!analysis) return;
+                await this.processBatchOfClassificationRetries([analysis], db);
+            });
+
+            changeStream.on('error', (err) => {
+                console.error('❌ [Scheduler] Classification retry change stream error. Restarting in 5s...', err.message);
+                setTimeout(() => this.startClassificationRetryWatcher(db), 5000);
+            });
+        } catch (error) {
+            console.warn(
+                '⚠️ [Scheduler] Could not start classification retry change stream (Replica Set?). Falling back to polling only.',
+                error.message
+            );
+        }
+    }
+
+    /**
+     * RECONCILIATION: Batched poll for classification retries (same scale pattern as follow-ups).
+     */
+    async processClassificationRetries(db) {
+        const categories = getClassificationRetryCategories();
+        if (categories.length === 0) return;
+
+        try {
+            const BATCH_SIZE = 1000;
+            const MAX_TOTAL_PROCESS = 20000;
+            let totalProcessed = 0;
+
+            while (totalProcessed < MAX_TOTAL_PROCESS) {
+                const analysesToProcess = await db
+                    .collection('call_analysis')
+                    .find({
+                        classificationRetryProcessed: { $ne: true },
+                        ...buildClassificationCategoryQuery(categories)
+                    })
+                    .sort({ created_at: 1 })
+                    .limit(BATCH_SIZE)
+                    .toArray();
+
+                if (analysesToProcess.length === 0) {
+                    break;
+                }
+
+                await this.processBatchOfClassificationRetries(analysesToProcess, db);
+                totalProcessed += analysesToProcess.length;
+            }
+        } catch (error) {
+            console.error('❌ [Scheduler] processClassificationRetries failed:', error.stack);
+        }
+    }
+
+    /**
+     * Schedules a standard retry dial (status retry + nextRetryAt) from classification — separate from follow-up / Next_Action.
+     */
+    async processBatchOfClassificationRetries(analyses, db) {
+        if (!analyses || analyses.length === 0) return;
+
+        const allowedCategories = new Set(getClassificationRetryCategories());
+
+        try {
+            const analysisIds = analyses.map((a) => a._id);
+            await db.collection('call_analysis').updateMany(
+                { _id: { $in: analysisIds } },
+                { $set: { classificationRetryProcessed: 'in-progress', updatedAt: new Date() } }
+            );
+
+            const campaignIds = [...new Set(analyses.map((a) => a.campaign_id).filter(Boolean))];
+            const campaigns = await db
+                .collection('campaigns')
+                .find({
+                    _id: { $in: campaignIds.map((id) => (typeof id === 'string' ? new ObjectId(id) : id)) }
+                })
+                .toArray();
+            const campaignMap = new Map(campaigns.map((c) => [c._id.toString(), c]));
+
+            const contactIdToObjectId = (value) => {
+                try {
+                    return typeof value === 'string' ? new ObjectId(value) : value;
+                } catch {
+                    return null;
+                }
+            };
+
+            const contactObjectIds = analyses.map((a) => contactIdToObjectId(a.contact_id)).filter(Boolean);
+            const contacts =
+                contactObjectIds.length > 0
+                    ? await db
+                          .collection('contactprocessings')
+                          .find(
+                              { _id: { $in: contactObjectIds } },
+                              {
+                                  projection: {
+                                      _id: 1,
+                                      status: 1,
+                                      callReceiveStatus: 1,
+                                      nextRetryAt: 1,
+                                      retryCount: 1,
+                                      callAttempts: 1
+                                  }
+                              }
+                          )
+                          .toArray()
+                    : [];
+            const contactMap = new Map(contacts.map((c) => [String(c._id), c]));
+
+            const contactBulkUpdates = [];
+            const analysisFinalUpdates = [];
+
+            for (const analysis of analyses) {
+                const { contact_id, campaign_id, analysis_data } = analysis;
+                const category = extractAnalysisClassificationCategory(analysis_data);
+
+                const finish = (fields) => {
+                    analysisFinalUpdates.push({
+                        updateOne: {
+                            filter: { _id: analysis._id },
+                            update: { $set: { ...fields, updatedAt: new Date() } }
+                        }
+                    });
+                };
+
+                /** Analysis often lands before contact is terminal; release claim so reconciliation retries. */
+                const releaseClassificationRetryClaim = () => {
+                    analysisFinalUpdates.push({
+                        updateOne: {
+                            filter: { _id: analysis._id },
+                            update: {
+                                $unset: { classificationRetryProcessed: '' },
+                                $set: { updatedAt: new Date() }
+                            }
+                        }
+                    });
+                };
+
+                if (!category || !allowedCategories.has(category)) {
+                    finish({
+                        classificationRetryProcessed: true,
+                        classificationRetryError: 'category_not_in_allowlist',
+                        classificationRetryCategorySeen: category || null
+                    });
+                    continue;
+                }
+
+                const campaign = campaignMap.get(campaign_id?.toString());
+                if (!campaign) {
+                    finish({
+                        classificationRetryProcessed: true,
+                        classificationRetryError: 'campaign_not_found'
+                    });
+                    continue;
+                }
+
+                if (campaign.archive === true) {
+                    finish({
+                        classificationRetryProcessed: true,
+                        classificationRetryError: 'campaign_archived'
+                    });
+                    continue;
+                }
+
+                if (!['active', 'processing'].includes(campaign.status)) {
+                    finish({
+                        classificationRetryProcessed: true,
+                        classificationRetryError: 'campaign_not_dialable',
+                        classificationRetrySkippedCampaignStatus: campaign.status
+                    });
+                    continue;
+                }
+
+                if (isCampaignBlockedByTestCall(campaign)) {
+                    finish({
+                        classificationRetryProcessed: true,
+                        classificationRetryError: 'campaign_testing'
+                    });
+                    continue;
+                }
+
+                const contactObjId = contactIdToObjectId(contact_id);
+                if (!contactObjId) {
+                    finish({
+                        classificationRetryProcessed: true,
+                        classificationRetryError: 'invalid_contact_id'
+                    });
+                    continue;
+                }
+
+                const contactSnapshot = contactMap.get(String(contactObjId));
+                if (!contactSnapshot) {
+                    finish({
+                        classificationRetryProcessed: true,
+                        classificationRetryError: 'contact_not_found'
+                    });
+                    continue;
+                }
+
+                const configuredMax = Number(campaign.maxRetryAttempts);
+                const maxRetries = Number.isFinite(configuredMax) ? Math.max(1, configuredMax) : 3;
+                const attemptsUsed = Array.isArray(contactSnapshot.callAttempts) ? contactSnapshot.callAttempts.length : 0;
+
+                if (attemptsUsed >= maxRetries) {
+                    finish({
+                        classificationRetryProcessed: true,
+                        classificationRetryError: 'max_retries_exhausted',
+                        classificationRetryAttemptsUsed: attemptsUsed,
+                        classificationRetryMaxAttempts: maxRetries
+                    });
+                    continue;
+                }
+
+                const st = String(contactSnapshot.status || '');
+                if (st === 'failed') {
+                    finish({
+                        classificationRetryProcessed: true,
+                        classificationRetryError: 'contact_failed_terminal'
+                    });
+                    continue;
+                }
+
+                if (['pending', 'enqueued', 'processing'].includes(st)) {
+                    releaseClassificationRetryClaim();
+                    continue;
+                }
+
+                if (st === 'retry') {
+                    finish({
+                        classificationRetryProcessed: true,
+                        classificationRetryError: 'contact_already_retry_scheduled',
+                        classificationRetrySkippedStatus: st
+                    });
+                    continue;
+                }
+
+                if (st !== 'completed') {
+                    finish({
+                        classificationRetryProcessed: true,
+                        classificationRetryError: 'unexpected_contact_status',
+                        classificationRetrySkippedStatus: st
+                    });
+                    continue;
+                }
+
+                const delayMs = Math.max(1, Number(campaign.retryDelayMinutes) || 30) * 60 * 1000;
+                const scheduledTime = new Date(Date.now() + delayMs);
+
+                contactBulkUpdates.push({
+                    updateOne: {
+                        filter: { _id: contactObjId, status: 'completed' },
+                        update: {
+                            $set: {
+                                status: 'retry',
+                                callReceiveStatus: 0,
+                                nextRetryAt: scheduledTime,
+                                updatedAt: new Date()
+                            },
+                            $push: {
+                                statusHistory: {
+                                    fromStatus: 'completed',
+                                    toStatus: 'retry',
+                                    reason: 'classification-retry',
+                                    analysisId: analysis._id,
+                                    classificationCategory: category,
+                                    scheduledAt: scheduledTime,
+                                    timestamp: new Date()
+                                }
+                            }
+                        }
+                    }
+                });
+
+                finish({
+                    classificationRetryProcessed: true,
+                    classificationRetryScheduledAt: scheduledTime,
+                    classificationRetryCategory: category,
+                    classificationRetryContactId: contact_id
+                });
+            }
+
+            const completedCampaignIdsToRestore = campaigns
+                .filter((c) => c.status === 'completed')
+                .map((c) => c._id);
+            if (completedCampaignIdsToRestore.length > 0) {
+                await db.collection('campaigns').updateMany(
+                    { _id: { $in: completedCampaignIdsToRestore } },
+                    { $set: { status: 'active', updatedAt: new Date() } }
+                );
+            }
+
+            if (contactBulkUpdates.length > 0) {
+                await db.collection('contactprocessings').bulkWrite(contactBulkUpdates, { ordered: false });
+            }
+            if (analysisFinalUpdates.length > 0) {
+                await db.collection('call_analysis').bulkWrite(analysisFinalUpdates, { ordered: false });
+            }
+        } catch (error) {
+            console.error('❌ [Scheduler] processBatchOfClassificationRetries failed:', error.message);
         }
     }
 }

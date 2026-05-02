@@ -223,6 +223,29 @@ export function isCampaignBlockedByTestCall(campaign) {
 }
 
 /**
+ * Reads `analysis_data.classification.Category` (supports `Classification` alias).
+ * @param {object|null|undefined} analysisData
+ * @returns {string|null}
+ */
+export function extractAnalysisClassificationCategory(analysisData) {
+    if (!analysisData || typeof analysisData !== 'object') return null;
+    const block = analysisData.classification || analysisData.Classification;
+    if (!block || typeof block !== 'object') return null;
+    const raw = block.Category ?? block.category;
+    if (typeof raw !== 'string') return null;
+    const t = raw.trim();
+    return t.length ? t : null;
+}
+
+/**
+ * Default categories that schedule a classification-based retry (comma-separated override via CLASSIFICATION_RETRY_CATEGORIES in scheduler).
+ */
+export const DEFAULT_CLASSIFICATION_RETRY_CATEGORIES = Object.freeze([
+    'Voice Mail',
+    'Other - Incomplete Call'
+]);
+
+/**
  * Parses a string time from IST into a UTC Date object.
  * Handles formats like "2026-03-12 10:00 AM", "10:00 AM" (assumes today), or ISO strings.
  * @param {string} timeStr 
